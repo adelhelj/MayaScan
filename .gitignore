@@ -1,0 +1,79 @@
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# ==============================
+# Virtual environments
+# ==============================
+venv/
+.env/
+.envrc/
+.python-version
+
+# ==============================
+# IDE / Editor
+# ==============================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ==============================
+# OS files
+# ==============================
+.DS_Store
+Thumbs.db
+
+# ==============================
+# LiDAR data (large - not tracked)
+# ==============================
+data/lidar/*
+!data/lidar/.gitkeep
+
+# ==============================
+# Pipeline outputs
+# ==============================
+runs/
+output/
+results/
+
+# ==============================
+# Generated analysis / GIS files
+# ==============================
+*.laz
+*.las
+*.tif
+*.tiff
+*.img
+*.geojson
+*.kml
+*.csv
+*.pdf
+*.png
+*.jpg
+*.log
+*.html
+
+# ==============================
+# Jupyter (optional)
+# ==============================
+.ipynb_checkpoints/
+
+# ==============================
+# Temporary files
+# ==============================
+tmp/
+temp/
+*_tmp/
+*.tmp
+*.bak
