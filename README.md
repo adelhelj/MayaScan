@@ -1,10 +1,10 @@
 # MayaScan
 
-**Automated LiDAR Archaeological Detection Pipeline**
+**Automated LiDAR Archaeological Detection Pipeline (CLI + Streamlit App)**
 
 MayaScan is an end-to-end geospatial analysis system for detecting and prioritizing potential archaeological structures (e.g., Maya mounds, platforms, terraces, and settlement patterns) from airborne LiDAR data.
 
-The pipeline converts raw LAZ/LAS point clouds into terrain models, extracts subtle micro-topography using multi-scale relief analysis, identifies candidate anthropogenic features, ranks them, clusters them into settlement patterns, and generates GIS-ready outputs and interactive reports to help experts quickly review the results.
+The pipeline converts raw LAZ/LAS point clouds into terrain models, extracts subtle micro-topography using multi-scale relief analysis, identifies candidate anthropogenic features, ranks them, clusters them into settlement patterns, and generates GIS-ready outputs and interactive reports to help experts quickly review results.
 
 Tested using publicly available datasets (e.g., Caracol, Belize) obtained from OpenTopography.
 
@@ -44,6 +44,33 @@ MayaScan was built as a personal research-engineering project to:
 
 ---
 
+## What You Get
+
+### Outputs (per run)
+
+- GeoTIFFs (DTM, LRM, density)
+- CSV candidate table (`candidates.csv`)
+- GeoJSON / KML exports (`candidates.geojson`, `candidates.kml`)
+- Plots and histograms (`plots/`)
+- Markdown + optional PDF summary (`report.md`, `report.pdf`)
+- Interactive HTML report with map + cutout panels (`report.html`, `html/img/`)
+
+### Review UX (Streamlit App)
+
+A lightweight Streamlit UI wraps the CLI pipeline so you can:
+
+- Upload a `.laz/.las` tile (or point to a local path)
+- Tune thresholds and filters with helpful tooltips
+- Run the pipeline and see live logs
+- Review results in one place:
+  - Interactive Leaflet map (Street + Satellite basemap toggle, no API keys)
+  - Ranked candidates table
+  - Candidate cutout panels (LRM + hillshade)
+  - Embedded `report.html`
+  - One-click downloads (CSV, GeoJSON, KML, whole-run ZIP)
+
+---
+
 ## End-to-End Pipeline
 
 ### 1. Ground Model (DTM)
@@ -60,7 +87,7 @@ Highlights subtle anthropogenic topography.
 
 ### 3. Region Detection
 Connected-component extraction with filters:
-- Minimum size
+- Minimum size (pixel count)
 - Slope limits
 - Morphological cleanup
 
@@ -68,8 +95,8 @@ Connected-component extraction with filters:
 For each region:
 - Area
 - Peak / mean relief
-- Extent (area / bounding box)
-- Aspect ratio
+- Extent (area / bounding box) *(compactness / “filled-ness”)*
+- Aspect ratio *(elongation)*
 - Width / height (meters)
 
 ### 5. Settlement Density Modeling
@@ -84,13 +111,12 @@ score = (density^a) × (peak^b) × (extent^c) × √area
 ```
 
 ### 7. Spatial Clustering
-- Auto-projected to UTM
+- Auto-projected to UTM (meters)
 - DBSCAN clustering
-- Automatic epsilon selection
+- Automatic epsilon selection (optional)
 - Distance to cluster core
 
 ### 8. Outputs
-
 - GeoTIFFs (DTM, LRM, density)
 - CSV candidate table
 - GeoJSON / KML
@@ -100,7 +126,7 @@ score = (density^a) × (peak^b) × (extent^c) × √area
 
 ---
 
-## Quick Start
+## Quick Start (CLI)
 
 Place a LiDAR tile locally (example):
 
@@ -151,6 +177,22 @@ runs/example_run/report.html
 
 ---
 
+## Quick Start (Streamlit App)
+
+If you have the Streamlit app file in the repo (example: `app.py`), run:
+
+```bash
+streamlit run app.py
+```
+
+Then:
+1. Upload a `.laz/.las` tile (or use a local path)
+2. Set a run name + parameters
+3. Click **Run MayaScan**
+4. Review results in the **Results** tab (map, ranked table, report)
+
+---
+
 ## LiDAR Data Sources
 
 LiDAR data is not included in this repository.
@@ -178,12 +220,52 @@ No API key is required.
 
 ---
 
+## Installation
+
+### Requirements
+- Python 3.10+
+- **PDAL installed separately** (system install)
+- (Optional) scikit-learn for DBSCAN clustering
+- (Optional) reportlab for PDF report output
+
+Install Python dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Sanity checks:
+- `pdal --version` should work
+- `python -c "import rasterio, pyproj, scipy"` should work
+
+---
+
+## Key Parameters (Practical Meaning)
+
+- `--pos-thresh auto:p96`  
+  Relief threshold for candidate detection in the LRM. Higher percentile = fewer, stronger bumps.
+
+- `--min-density auto:p55` + `--density-sigma 40`  
+  Builds a smoothed “feature density” raster, suppressing isolated noise and emphasizing settlement-like zones.
+
+- Shape cleanup filters:
+  - `--min-peak` (m): drop tiny terrain wiggles
+  - `--min-area-m2` (m²): drop very small patches
+  - `--min-extent` (0–1): keep coherent/filled regions (area / bbox_area)
+  - `--max-aspect` (≥1): drop long skinny ridge-like artifacts
+
+- `--cluster-eps auto` + `--min-samples 4`  
+  DBSCAN clustering in **meters** (auto-UTM projection if source CRS is geographic). Useful for settlement pattern grouping.
+
+---
+
 ## Technologies Used
 
 Python · NumPy · SciPy · Rasterio · PyProj  
 PDAL · GeoTIFF · UTM reprojection  
 Scikit-learn (DBSCAN)  
 Matplotlib · Leaflet · ReportLab  
+Streamlit (UI wrapper)
 
 ---
 
@@ -207,16 +289,18 @@ All design decisions, validation, and interpretation were performed manually.
 - Density modeling and clustering  
 - Multi-scale signal processing  
 - Automated reporting and visualization  
+- Building a review UI (Streamlit) for fast analyst workflows
 
 ---
 
 ## Repository Structure
 
-Tracked in this repository:
+Tracked in this repository (typical):
 
 ```
 MayaScan/
-├── maya_scan.py
+├── maya_scan.py          # CLI pipeline
+├── app.py                # Streamlit UI (runs the CLI, renders results)
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
@@ -232,20 +316,6 @@ runs/
 data/lidar/*.laz
 data/lidar/*.las
 data/lidar/*.tif
-```
-
----
-
-## Installation
-
-Requirements:
-- Python 3.10+
-- PDAL installed separately
-
-Install dependencies:
-
-```bash
-pip install -r requirements.txt
 ```
 
 ---
