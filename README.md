@@ -1,12 +1,43 @@
 # MayaScan
 
-**Automated LiDAR Archaeological Detection Pipeline (CLI + Streamlit App)**
+**Automated LiDAR Archaeological Detection Pipeline (CLI + Streamlit)**
 
-MayaScan is an end-to-end geospatial analysis system for detecting and prioritizing potential archaeological structures (e.g., Maya mounds, platforms, terraces, and settlement patterns) from airborne LiDAR data.
+*From raw LiDAR to ranked archaeological targets in one run.*
 
-The pipeline converts raw LAZ/LAS point clouds into terrain models, extracts subtle micro-topography using multi-scale relief analysis, identifies candidate anthropogenic features, ranks them, clusters them into settlement patterns, and generates GIS-ready outputs and interactive reports to help experts quickly review results.
+---
 
-Tested using publicly available datasets (e.g., Caracol, Belize) obtained from OpenTopography.
+## From Visible Ruins to Hidden Landscapes
+
+<p align="center">
+  <img src="assets/caracol_caana.png" width="700">
+</p>
+<p align="center">
+  <em>Caana pyramid at Caracol, Belize — visible monumental architecture</em>
+</p>
+
+<p align="center">
+  <img src="assets/aguada_fenix_lidar.png" width="700">
+</p>
+<p align="center">
+  <em>LiDAR terrain model of Aguada Fénix, Mexico — large-scale Maya architecture revealed beneath forest canopy</em>
+</p>
+
+Airborne LiDAR can reveal landscape-scale archaeological features that are often invisible at ground level. The challenge is no longer discovery alone, but efficiently turning large terrain datasets into focused targets for expert review.
+
+**MayaScan** is a Python-based geospatial pipeline that converts raw LAZ/LAS point clouds into terrain models, automatically detects and ranks candidate archaeological features, and provides an integrated review workflow through both a command-line interface and a Streamlit web app.
+
+Using multi-scale relief analysis and spatial density modeling, the system highlights subtle micro-topography, identifies potential anthropogenic structures (such as mounds, platforms, terraces, and settlement patterns), groups them into spatial clusters, and generates GIS-ready outputs and interactive reports for rapid evaluation.
+
+The workflow is designed to process high-resolution terrain data efficiently and has been developed and tested using publicly available datasets (e.g., Caracol, Belize) from OpenTopography.
+
+### Key capabilities
+
+- LAZ/LAS → DTM, LRM, and density surfaces
+- Automated candidate detection and scoring
+- Settlement clustering using DBSCAN
+- Interactive HTML reports with cutouts and metrics
+- GIS-ready exports (CSV, GeoJSON, KML)
+- Streamlit interface for end-to-end review
 
 ---
 
@@ -46,6 +77,8 @@ MayaScan was built as a personal research-engineering project to:
 
 ## What You Get
 
+Designed for rapid analyst workflows — from raw LiDAR to prioritized candidate review in a single run.
+
 ### Outputs (per run)
 
 - GeoTIFFs (DTM, LRM, density)
@@ -68,6 +101,34 @@ A lightweight Streamlit UI wraps the CLI pipeline so you can:
   - Candidate cutout panels (LRM + hillshade)
   - Embedded `report.html`
   - One-click downloads (CSV, GeoJSON, KML, whole-run ZIP)
+
+---
+
+## Example Results
+
+*Sample outputs from a typical MayaScan run (placeholder — visuals will be refined as the UI evolves).*
+
+<p align="center">
+  <img src="assets/demo_streamlit.png" width="900">
+</p>
+<p align="center">
+  <em>Streamlit results dashboard showing interactive map, ranked candidates, and run outputs</em>
+</p>
+
+<p align="center">
+  <img src="assets/demo_report.png" width="900">
+</p>
+<p align="center">
+  <em>Generated HTML report with candidate cutouts and summary metrics</em>
+</p>
+
+Typical results include:
+- Ranked candidate features prioritized by score
+- Spatial clustering highlighting settlement patterns
+- Multi-scale terrain visualizations (LRM, hillshade, density)
+- GIS-ready exports for further analysis
+
+*(Replace the placeholder images in `assets/` as the UI and reports are refined.)*
 
 ---
 
@@ -126,6 +187,31 @@ score = (density^a) × (peak^b) × (extent^c) × √area
 
 ---
 
+## Quick Start (Streamlit App)
+
+If you have the Streamlit app file in the repo (example: `app.py`), run:
+
+```bash
+# Run the Streamlit app
+streamlit run app.py
+```
+
+Then:
+1. Upload a `.laz/.las` tile (or use a local path)
+2. Set a run name + parameters
+3. Click **Run MayaScan**
+4. Review results in the **Results** tab:
+   - Interactive map (Street/Satellite)
+   - Ranked candidate features
+   - Generated HTML report
+   - Downloadable GIS outputs
+
+Outputs are saved to:
+
+```
+runs/<run_name>/
+```
+
 ## Quick Start (CLI)
 
 Place a LiDAR tile locally (example):
@@ -175,23 +261,6 @@ Open the interactive report:
 runs/example_run/report.html
 ```
 
----
-
-## Quick Start (Streamlit App)
-
-If you have the Streamlit app file in the repo (example: `app.py`), run:
-
-```bash
-streamlit run app.py
-```
-
-Then:
-1. Upload a `.laz/.las` tile (or use a local path)
-2. Set a run name + parameters
-3. Click **Run MayaScan**
-4. Review results in the **Results** tab (map, ranked table, report)
-
----
 
 ## LiDAR Data Sources
 
@@ -200,7 +269,7 @@ LiDAR data is not included in this repository.
 Public datasets can be obtained from:
 
 **OpenTopography**  
-https://opentopography.org/
+<https://opentopography.org/>
 
 Example workflow:
 1. Create a free OpenTopography account  
@@ -227,6 +296,12 @@ No API key is required.
 - **PDAL installed separately** (system install)
 - (Optional) scikit-learn for DBSCAN clustering
 - (Optional) reportlab for PDF report output
+
+**PDAL must be installed separately.** Example installs:
+
+- macOS: `brew install pdal`
+- Ubuntu: `sudo apt install pdal`
+- Windows (conda): `conda install -c conda-forge pdal`
 
 Install Python dependencies:
 
@@ -347,3 +422,17 @@ MayaScan is an independent personal research project and is **not affiliated wit
 - Landscape-scale interpretation  
 
 This project reflects a personal interest in Maya history and explores how modern software engineering can be applied to large-scale archaeological terrain analysis.
+
+---
+
+## Image Credits
+
+**Caana, Caracol (Belize)**  
+Photo by Devon Jones — Wikimedia Commons  
+License: CC BY-SA 3.0  
+<https://commons.wikimedia.org/wiki/File:Caracol-Temple.jpg>
+
+**Aguada Fénix LiDAR**  
+Courtesy of Takeshi Inomata — Wikimedia Commons  
+License: CC BY-SA 4.0  
+<https://commons.wikimedia.org/wiki/File:Aguada_F%C3%A9nix_1.jpg>
