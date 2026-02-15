@@ -65,6 +65,10 @@ results/
 *.log
 *.html
 
+# Keep repository media assets tracked
+!assets/
+!assets/**
+
 # ==============================
 # Jupyter (optional)
 # ==============================
