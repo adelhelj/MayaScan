@@ -115,7 +115,7 @@ A lightweight Streamlit UI wraps the CLI pipeline so you can upload a `.laz/.las
 - Ranked candidates table
 - Candidate cutout panels (LRM + hillshade)
 - Embedded `report.html` (when enabled)
-- One-click downloads (CSV, GeoJSON, KML, whole-run ZIP)
+- Download actions for CSV, GeoJSON, KML, and whole-run ZIP
 
 ---
 
@@ -123,19 +123,7 @@ A lightweight Streamlit UI wraps the CLI pipeline so you can upload a `.laz/.las
 
 *Sample outputs from a typical MayaScan run.*
 
-<p align="center">
-  <img src="assets/demo_streamlit.png" width="900">
-</p>
-<p align="center">
-  <em>Streamlit results dashboard showing interactive map, ranked candidates, and run outputs</em>
-</p>
-
-<p align="center">
-  <img src="assets/demo_report.png" width="900">
-</p>
-<p align="center">
-  <em>Generated HTML report with candidate cutouts and summary metrics</em>
-</p>
+> WIP: Demo screenshots (`assets/demo_streamlit.png`, `assets/demo_report.png`) will be added soon.
 
 Typical results include:
 - Ranked candidate features prioritized by score
@@ -258,7 +246,7 @@ Highlights subtle anthropogenic topography.
 ### 3. Region Detection
 Connected-component extraction with filters:
 - Minimum size (pixel count)
-- Slope limits
+- Region slope limit (q75 of slope values in each region)
 - Morphological cleanup
 
 ### 4. Shape Metrics
@@ -273,6 +261,7 @@ For each region:
 - Binary mound mask
 - Gaussian smoothing
 - Percentile thresholding
+- Region-level density statistics (mean/q75) per candidate region
 
 ### 6. Scoring
 
@@ -280,8 +269,10 @@ For each region:
 score = (density^a) × (peak^b) × (extent^c) × √area
 ```
 
+Where `density` is the **region mean density** (not a single centroid pixel).
+
 ### 7. Spatial Clustering
-- Auto-projected to UTM (meters)
+- Meter-based coordinates for clustering/distances (projected CRS is used directly with unit→meter conversion when needed; geographic CRS auto-projects to UTM)
 - DBSCAN clustering
 - Automatic epsilon selection (optional)
 - Distance to cluster core
@@ -321,7 +312,10 @@ No API key is required.
   Relief threshold for candidate detection in the LRM. Higher percentile = fewer, stronger bumps.
 
 - `--min-density auto:p55` + `--density-sigma 40`  
-  Builds a smoothed “feature density” raster, suppressing isolated noise and emphasizing settlement-like zones.
+  Builds a smoothed “feature density” raster, suppressing isolated noise and emphasizing settlement-like zones. Candidate gating/scoring use **region mean density**.
+
+- Internal region slope filter (default 25°)  
+  Uses the **75th percentile slope (q75)** over each region footprint to reject steep/noisy terrain artifacts.
 
 - Shape cleanup filters:
   - `--min-peak` (m): drop tiny terrain wiggles
@@ -330,7 +324,10 @@ No API key is required.
   - `--max-aspect` (≥1): drop long skinny ridge-like artifacts
 
 - `--cluster-eps auto` + `--min-samples 4`  
-  DBSCAN clustering in **meters** (auto-UTM projection if source CRS is geographic). Useful for settlement pattern grouping.
+  DBSCAN clustering in **meters** (projected CRS units are converted to meters when needed; geographic CRS auto-projects to UTM). Useful for settlement pattern grouping.
+
+- `--score-extent-exp`  
+  Controls exponent `c` in `score = density^a × peak^b × extent^c × √area`. Higher values favor compact/high-extent regions. (CLI advanced option; Streamlit currently uses the default.)
 
 ---
 
@@ -338,6 +335,7 @@ No API key is required.
 
 - MayaScan flags terrain anomalies, not confirmed archaeology; expert interpretation is required.
 - False positives can increase in rugged terrain, modern earthworks, or heavily modified agricultural zones.
+- Newer region-level filtering can produce fewer candidates and lower absolute scores than centroid-based filtering; this is expected and often improves ranking stability.
 - Performance depends on point-cloud quality, ground classification quality, and chosen thresholds.
 - Current workflow is primarily tuned for single-tile or tile-at-a-time exploratory analysis.
 
