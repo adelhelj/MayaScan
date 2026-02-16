@@ -14,9 +14,9 @@ One-file Maya LiDAR pipeline:
 
 Project-goal improvements:
 - Region shape metrics: bbox fill "extent" (area / bbox_area), aspect ratio, width/height (m)
-- Post-filters: min_peak, min_area_m2, min_extent, max_aspect
-- Score supports extent^c term
-- Extra plots: extent/aspect histograms
+- Post-filters: min_peak, min_area_m2, min_extent, max_aspect, min_prominence, min_compactness, min_solidity
+- Score supports extent/prominence/compactness/solidity terms
+- Extra plots: extent/aspect/compactness/solidity/prominence histograms
 - Safer out_dir: only delete existing run with --overwrite
 
 Dependencies:
@@ -39,6 +39,7 @@ python maya_scan.py \
   --min-area-m2 25 \
   --min-extent 0.38 \
   --max-aspect 3.5 \
+  --min-prominence 0.10 \
   --max-slope-deg 20 \
   --min-compactness 0.12 \
   --min-solidity 0.50 \
@@ -68,7 +69,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import rasterio
 from rasterio.transform import xy as pix2map_xy
-from scipy.ndimage import binary_closing, binary_erosion, binary_opening, gaussian_filter, label as cc_label
+from scipy.ndimage import binary_closing, binary_dilation, binary_erosion, binary_opening, gaussian_filter, label as cc_label
 from scipy.spatial import ConvexHull, QhullError
 from pyproj import CRS, Transformer
 
@@ -157,6 +158,8 @@ class Params:
     min_area_m2: float = 25.0              # e.g. 30
     min_extent: float = 0.38               # bbox fill, 0..1 (e.g. 0.35)
     max_aspect: float = 3.5                # width/height or height/width (e.g. 4.0)
+    prominence_ring_pixels: int = 6        # ring width (pixels) for local prominence estimate
+    min_prominence_m: float = 0.10         # region mean relief - local ring mean relief
     min_compactness: float = 0.12          # 4*pi*A/P^2 in [0,1], lower = line-like
     min_solidity: float = 0.50             # A / convex_hull_A in [0,1], lower = fragmented/linear
 
@@ -175,10 +178,11 @@ class Params:
     cutout_dpi: int = 160
 
     # Score
-    # score = density^a * peak_relief^b * extent^c * compactness^d * solidity^e * area_m2^f
+    # score = density^a * peak_relief^b * extent^c * prominence^d * compactness^e * solidity^f * area_m2^g
     score_density_exp: float = 1.0
     score_peak_exp: float = 1.0
     score_extent_exp: float = 0.35
+    score_prominence_exp: float = 0.75
     score_compactness_exp: float = 0.20
     score_solidity_exp: float = 0.20
     score_area_exp: float = 0.50
@@ -506,6 +510,7 @@ class Candidate:
     density: float
     extent: float              # bbox fill (0..1)
     aspect: float              # >=1
+    prominence_m: float        # mean relief over region minus local ring mean
     compactness: float         # 4*pi*A/P^2 in [0,1]
     solidity: float            # A / convex_hull_A in [0,1]
     width_m: float
@@ -609,6 +614,12 @@ def _extract_candidate_regions(
 
         peak = float(np.nanmax(lrm[region]))
         mean = float(np.nanmean(lrm[region]))
+        ring_iters = max(1, int(params.prominence_ring_pixels))
+        ring_mask = binary_dilation(region, iterations=ring_iters) & ~region
+        ring_vals = lrm[ring_mask]
+        ring_vals = ring_vals[np.isfinite(ring_vals)]
+        ring_mean_relief_m = float(np.mean(ring_vals)) if ring_vals.size else mean
+        prominence_m = float(mean - ring_mean_relief_m)
 
         # bbox shape metrics
         x0 = int(xs.min())
@@ -640,6 +651,8 @@ def _extract_candidate_regions(
                 "area_m2": area_m2,
                 "peak": peak,
                 "mean": mean,
+                "ring_mean_relief_m": ring_mean_relief_m,
+                "prominence_m": prominence_m,
                 "extent": extent,
                 "aspect": aspect,
                 "width_m": w_m,
@@ -844,6 +857,7 @@ def write_geojson(candidates: List[Candidate], out_path: Path) -> None:
                     "area_m2": c.area_m2,
                     "extent": c.extent,
                     "aspect": c.aspect,
+                    "prominence_m": c.prominence_m,
                     "compactness": c.compactness,
                     "solidity": c.solidity,
                     "width_m": c.width_m,
@@ -870,6 +884,7 @@ def write_csv(candidates: List[Candidate], out_path: Path) -> None:
                 "area_m2",
                 "extent",
                 "aspect",
+                "prominence_m",
                 "compactness",
                 "solidity",
                 "width_m",
@@ -891,6 +906,7 @@ def write_csv(candidates: List[Candidate], out_path: Path) -> None:
                     f"{c.area_m2:.2f}",
                     f"{c.extent:.4f}",
                     f"{c.aspect:.3f}",
+                    f"{c.prominence_m:.4f}",
                     f"{c.compactness:.4f}",
                     f"{c.solidity:.4f}",
                     f"{c.width_m:.2f}",
@@ -959,6 +975,7 @@ def write_kml(candidates: List[Candidate], out_path: Path, label_top_n: int) -> 
             f"area_m2={c.area_m2:.0f}<br/>"
             f"extent={c.extent:.3f}<br/>"
             f"aspect={c.aspect:.2f}<br/>"
+            f"prominence_m={c.prominence_m:.3f}<br/>"
             f"compactness={c.compactness:.3f}<br/>"
             f"solidity={c.solidity:.3f}<br/>"
             f"cluster_id={c.cluster_id}"
@@ -1032,6 +1049,7 @@ def make_plots(out_dir: Path, lrm: np.ndarray, density: np.ndarray, candidates: 
 
     scores = np.array([c.score for c in candidates], dtype=float)
     peaks = np.array([c.peak_relief_m for c in candidates], dtype=float)
+    prominence = np.array([c.prominence_m for c in candidates], dtype=float)
     areas = np.array([c.area_m2 for c in candidates], dtype=float)
     extents = np.array([c.extent for c in candidates], dtype=float)
     aspects = np.array([c.aspect for c in candidates], dtype=float)
@@ -1054,6 +1072,16 @@ def make_plots(out_dir: Path, lrm: np.ndarray, density: np.ndarray, candidates: 
     plt.xlabel("peak relief (m)")
     plt.ylabel("count")
     p = plots_dir / "peak_relief_hist.png"
+    plt.savefig(p, dpi=160, bbox_inches="tight")
+    plt.close()
+    LOG.info("Wrote plot: %s", p)
+
+    plt.figure(figsize=(10, 5))
+    plt.hist(prominence, bins=30)
+    plt.title("Local prominence distribution")
+    plt.xlabel("prominence (m)")
+    plt.ylabel("count")
+    p = plots_dir / "prominence_hist.png"
     plt.savefig(p, dpi=160, bbox_inches="tight")
     plt.close()
     LOG.info("Wrote plot: %s", p)
@@ -1153,12 +1181,12 @@ def write_report_md(
     md.append(f"- min_density: **{min_density:.4f}** (spec: `{params.min_density_spec}`)")
     md.append(
         f"- post-filters: min_peak={params.min_peak_relief_m:.2f}m, min_area={params.min_area_m2:.1f}m², "
-        f"min_extent={params.min_extent:.2f}, max_aspect={params.max_aspect:.2f}, "
+        f"min_extent={params.min_extent:.2f}, max_aspect={params.max_aspect:.2f}, min_prominence={params.min_prominence_m:.2f}m, "
         f"min_compactness={params.min_compactness:.2f}, min_solidity={params.min_solidity:.2f}"
     )
     md.append(
         f"- score exponents: dens^{params.score_density_exp:.2f}, peak^{params.score_peak_exp:.2f}, "
-        f"extent^{params.score_extent_exp:.2f}, compactness^{params.score_compactness_exp:.2f}, "
+        f"extent^{params.score_extent_exp:.2f}, prominence^{params.score_prominence_exp:.2f}, compactness^{params.score_compactness_exp:.2f}, "
         f"solidity^{params.score_solidity_exp:.2f}, area^{params.score_area_exp:.2f}"
     )
     md.append(f"- cluster_eps_mode: **{params.cluster_eps_mode}** (base={params.cluster_eps_m:.1f} m), min_samples: **{params.cluster_min_samples}**")
@@ -1170,17 +1198,18 @@ def write_report_md(
     md.append("")
     md.append("## Top candidates")
     md.append("")
-    md.append("| rank | cand_id | score | dens | peak(m) | area(m²) | extent | aspect | compactness | solidity | cluster | lon | lat |")
-    md.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    md.append("| rank | cand_id | score | dens | peak(m) | prominence(m) | area(m²) | extent | aspect | compactness | solidity | cluster | lon | lat |")
+    md.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for i, c in enumerate(top, start=1):
         md.append(
-            f"| {i} | {c.cand_id} | {c.score:.4f} | {c.density:.3f} | {c.peak_relief_m:.2f} | {c.area_m2:.0f} | "
+            f"| {i} | {c.cand_id} | {c.score:.4f} | {c.density:.3f} | {c.peak_relief_m:.2f} | {c.prominence_m:.2f} | {c.area_m2:.0f} | "
             f"{c.extent:.2f} | {c.aspect:.2f} | {c.compactness:.2f} | {c.solidity:.2f} | {c.cluster_id} | {c.lon:.6f} | {c.lat:.6f} |"
         )
     md.append("")
     md.append("## Notes")
     md.append("- Extent = **area / bbox_area** (0..1). Higher generally means more coherent/filled region.")
     md.append("- Aspect = max(width/height, height/width). Very large aspect often means linear/noisy ridges.")
+    md.append("- Local prominence = **region mean relief - surrounding ring mean relief**. Low values often indicate background trends.")
     md.append("- Compactness = **4πA/P²** (0..1). Lower values are more line-like and likely false positives.")
     md.append("- Solidity = **area / convex_hull_area** (0..1). Lower values are fragmented/irregular shapes.")
     md.append("- Slope filter uses **region slope q75** (not centroid slope).")
@@ -1349,7 +1378,7 @@ def generate_candidate_panels(
 
         fig.suptitle(
             f"{run_name} — cand {c.cand_id} | score {c.score:.3f} | dens {c.density:.3f} | "
-            f"peak {c.peak_relief_m:.2f}m | extent {c.extent:.2f}",
+            f"peak {c.peak_relief_m:.2f}m | prom {c.prominence_m:.2f}m | extent {c.extent:.2f}",
             fontsize=10,
         )
 
@@ -1390,6 +1419,7 @@ def write_html_report(
                 "score": c.score,
                 "density": c.density,
                 "peak": c.peak_relief_m,
+                "prominence": c.prominence_m,
                 "area": c.area_m2,
                 "extent": c.extent,
                 "aspect": c.aspect,
@@ -1476,7 +1506,7 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
             img_tag = f"<img src='{html.escape(c.img_relpath)}' alt='candidate {c.cand_id} cutout'/>"
         doc += f"""
 <h3>Candidate {c.cand_id} <span class='badge'>rank {rank}</span> — score {c.score:.3f}</h3>
-<p><b>dens</b> {c.density:.3f} | <b>peak</b> {c.peak_relief_m:.2f} m | <b>area</b> {c.area_m2:.0f} m² |
+<p><b>dens</b> {c.density:.3f} | <b>peak</b> {c.peak_relief_m:.2f} m | <b>prom</b> {c.prominence_m:.2f} m | <b>area</b> {c.area_m2:.0f} m² |
 <b>extent</b> {c.extent:.2f} | <b>aspect</b> {c.aspect:.2f} | <b>compactness</b> {c.compactness:.2f} | <b>solidity</b> {c.solidity:.2f} | <b>cluster</b> {c.cluster_id}</p>
 <p><a href='{gmaps}' target='_blank'>{c.lat:.6f}, {c.lon:.6f}</a></p>
 {img_tag}
@@ -1490,7 +1520,7 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
 <table>
 <thead>
 <tr>
-<th>rank</th><th>cand_id</th><th>score</th><th>dens</th><th>peak(m)</th><th>area(m²)</th><th>extent</th><th>aspect</th><th>compact</th><th>solidity</th><th>cluster</th><th>lat</th><th>lon</th>
+<th>rank</th><th>cand_id</th><th>score</th><th>dens</th><th>peak(m)</th><th>prom(m)</th><th>area(m²)</th><th>extent</th><th>aspect</th><th>compact</th><th>solidity</th><th>cluster</th><th>lat</th><th>lon</th>
 </tr>
 </thead>
 <tbody>
@@ -1504,6 +1534,7 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
             f"<td>{c.score:.3f}</td>"
             f"<td>{c.density:.3f}</td>"
             f"<td>{c.peak_relief_m:.2f}</td>"
+            f"<td>{c.prominence_m:.2f}</td>"
             f"<td>{c.area_m2:.0f}</td>"
             f"<td>{c.extent:.2f}</td>"
             f"<td>{c.aspect:.2f}</td>"
@@ -1553,7 +1584,7 @@ points.forEach(p => {{
     <div style="font-size:14px">
       <b>Candidate ${{p.cand_id}}</b><br/>
       score <b>${{p.score.toFixed(3)}}</b> | dens ${{p.density.toFixed(3)}}<br/>
-      peak ${{p.peak.toFixed(2)}}m | area ${{Math.round(p.area)}} m²<br/>
+      peak ${{p.peak.toFixed(2)}}m | prom ${{p.prominence.toFixed(2)}}m | area ${{Math.round(p.area)}} m²<br/>
       extent ${{p.extent.toFixed(2)}} | aspect ${{p.aspect.toFixed(2)}}<br/>
       compactness ${{p.compactness.toFixed(2)}} | solidity ${{p.solidity.toFixed(2)}}<br/>
       cluster ${{p.cluster}}<br/>
@@ -1608,11 +1639,14 @@ def main() -> None:
     ap.add_argument("--min-area-m2", type=_arg_nonnegative_float, default=None, help="Min area (m^2) post-filter (e.g. 30)")
     ap.add_argument("--min-extent", type=_arg_unit_interval, default=None, help="Min extent (0..1) post-filter (e.g. 0.35)")
     ap.add_argument("--max-aspect", type=_arg_ge_one_float, default=None, help="Max aspect ratio post-filter (e.g. 4.0)")
+    ap.add_argument("--prominence-ring-pix", type=_arg_positive_int, default=None, help="Ring width (pixels) for local prominence estimate (default 6)")
+    ap.add_argument("--min-prominence", type=_arg_nonnegative_float, default=None, help="Min local prominence (m) post-filter (default 0.10)")
     ap.add_argument("--min-compactness", type=_arg_unit_interval, default=None, help="Min compactness 4*pi*A/P^2 (0..1), lower removes line-like shapes")
     ap.add_argument("--min-solidity", type=_arg_unit_interval, default=None, help="Min solidity area/convex_hull_area (0..1), lower removes fragmented/linear shapes")
 
     # scoring knobs
     ap.add_argument("--score-extent-exp", type=_arg_nonnegative_float, default=None, help="Exponent for extent in score (default 0.35)")
+    ap.add_argument("--score-prominence-exp", type=_arg_nonnegative_float, default=None, help="Exponent for prominence in score (default 0.75)")
     ap.add_argument("--score-compactness-exp", type=_arg_nonnegative_float, default=None, help="Exponent for compactness in score (default 0.20)")
     ap.add_argument("--score-solidity-exp", type=_arg_nonnegative_float, default=None, help="Exponent for solidity in score (default 0.20)")
     ap.add_argument("--score-area-exp", type=_arg_nonnegative_float, default=None, help="Exponent for area_m2 in score (default 0.50)")
@@ -1657,6 +1691,10 @@ def main() -> None:
         params.min_extent = args.min_extent
     if args.max_aspect is not None:
         params.max_aspect = args.max_aspect
+    if args.prominence_ring_pix is not None:
+        params.prominence_ring_pixels = args.prominence_ring_pix
+    if args.min_prominence is not None:
+        params.min_prominence_m = args.min_prominence
     if args.min_compactness is not None:
         params.min_compactness = args.min_compactness
     if args.min_solidity is not None:
@@ -1664,6 +1702,8 @@ def main() -> None:
 
     if args.score_extent_exp is not None:
         params.score_extent_exp = args.score_extent_exp
+    if args.score_prominence_exp is not None:
+        params.score_prominence_exp = args.score_prominence_exp
     if args.score_compactness_exp is not None:
         params.score_compactness_exp = args.score_compactness_exp
     if args.score_solidity_exp is not None:
@@ -1775,6 +1815,7 @@ def main() -> None:
         area_m2 = float(r["area_m2"])
         extent = float(r["extent"])
         aspect = float(r["aspect"])
+        prominence = float(r.get("prominence_m", 0.0))
         compactness = float(r.get("compactness", 0.0))
         solidity = float(r.get("solidity", 0.0))
 
@@ -1784,6 +1825,7 @@ def main() -> None:
             or area_m2 < params.min_area_m2
             or extent < params.min_extent
             or aspect > params.max_aspect
+            or prominence < params.min_prominence_m
             or compactness < params.min_compactness
             or solidity < params.min_solidity
         ):
@@ -1794,6 +1836,7 @@ def main() -> None:
             (dens ** params.score_density_exp)
             * (max(1e-9, peak) ** params.score_peak_exp)
             * ((max(1e-6, extent)) ** params.score_extent_exp)
+            * ((max(1e-6, prominence)) ** params.score_prominence_exp)
             * ((max(1e-6, compactness)) ** params.score_compactness_exp)
             * ((max(1e-6, solidity)) ** params.score_solidity_exp)
             * (max(1e-9, area_m2) ** params.score_area_exp)
@@ -1813,6 +1856,7 @@ def main() -> None:
                 density=dens,
                 extent=extent,
                 aspect=aspect,
+                prominence_m=prominence,
                 compactness=compactness,
                 solidity=solidity,
                 width_m=float(r["width_m"]),

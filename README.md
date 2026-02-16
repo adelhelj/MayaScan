@@ -59,7 +59,8 @@ Using multi-scale relief analysis and spatial density modeling, MayaScan highlig
 - LAZ/LAS → DTM, LRM, and density surfaces
 - Automated candidate detection and scoring
 - Settlement clustering using DBSCAN
-- In-app preset comparison (Strict vs Balanced vs Exploratory)
+- In-app preset comparison (bars + baseline deltas)
+- Run-quality badge + reproducibility provenance block
 - Interactive HTML reports with cutouts and metrics
 - GIS-ready exports (CSV, GeoJSON, KML)
 - Streamlit interface for end-to-end review
@@ -115,6 +116,10 @@ MayaScan was built to:
 A lightweight Streamlit UI wraps the CLI pipeline so you can upload a `.laz/.las` tile (or use a local path), tune thresholds with tooltips, run the pipeline with live logs, and review results in one place:
 - Preset profiles for reproducible runs (`Strict`, `Balanced`, `Exploratory`)
 - Side-by-side preset comparison summary (`.json` + `.md`) from inside the app
+- Dedicated **Comparison** tab with visual bars + deltas vs baseline preset
+- Run-quality badge with explicit heuristic checks
+- Copyable/downloadable provenance block for reproducibility
+- Optional portfolio mode to hide diagnostics-heavy sections
 - Interactive Leaflet map (Street + Satellite basemap toggle, no API keys)
 - Ranked candidates table
 - Candidate cutout panels (LRM + hillshade)
@@ -214,6 +219,7 @@ python maya_scan.py \
   --min-area-m2 25 \
   --min-extent 0.38 \
   --max-aspect 3.5 \
+  --min-prominence 0.10 \
   --min-compactness 0.12 \
   --min-solidity 0.50 \
   --cluster-eps auto \
@@ -260,8 +266,11 @@ Connected-component extraction with filters:
 For each region:
 - Area
 - Peak / mean relief
+- Local prominence (region mean relief minus surrounding ring mean)
 - Extent (area / bounding box) *(compactness / “filled-ness”)*
 - Aspect ratio *(elongation)*
+- Compactness (`4πA/P²`)
+- Solidity (`Area / ConvexHullArea`)
 - Width / height (meters)
 
 ### 5. Settlement Density Modeling
@@ -273,7 +282,7 @@ For each region:
 ### 6. Scoring
 
 ```
-score = (density^a) × (peak^b) × (extent^c) × (compactness^d) × (solidity^e) × (area^f)
+score = (density^a) × (peak^b) × (extent^c) × (prominence^d) × (compactness^e) × (solidity^f) × (area^g)
 ```
 
 Where `density` is the **region mean density** (not a single centroid pixel).
@@ -329,14 +338,15 @@ No API key is required.
   - `--min-area-m2` (m²): drop very small patches
   - `--min-extent` (0–1): keep coherent/filled regions (area / bbox_area)
   - `--max-aspect` (≥1): drop long skinny ridge-like artifacts
+  - `--min-prominence` (m): drop features that do not stand out from local background ring
   - `--min-compactness` (0–1): drop line-like regions (`4πA/P²`)
   - `--min-solidity` (0–1): drop fragmented/irregular regions (`A / hull_area`)
 
 - `--cluster-eps auto` + `--min-samples 4`  
   DBSCAN clustering in **meters** (projected CRS units are converted to meters when needed; geographic CRS auto-projects to UTM). Useful for settlement pattern grouping.
 
-- Score exponents (`--score-extent-exp`, `--score-compactness-exp`, `--score-solidity-exp`, `--score-area-exp`)  
-  Control how strongly extent/compactness/solidity/area influence ranking.
+- Score exponents (`--score-extent-exp`, `--score-prominence-exp`, `--score-compactness-exp`, `--score-solidity-exp`, `--score-area-exp`)  
+  Control how strongly extent/prominence/compactness/solidity/area influence ranking.
 
 ---
 

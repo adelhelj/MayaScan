@@ -31,6 +31,7 @@ PRESET_VALUES: dict[str, dict[str, object]] = {
         "cfg_min_area_m2": 25.0,
         "cfg_min_extent": 0.38,
         "cfg_max_aspect": 3.5,
+        "cfg_min_prominence": 0.10,
         "cfg_min_compactness": 0.12,
         "cfg_min_solidity": 0.50,
         "cfg_cluster_eps": "auto",
@@ -47,6 +48,7 @@ PRESET_VALUES: dict[str, dict[str, object]] = {
         "cfg_min_area_m2": 35.0,
         "cfg_min_extent": 0.42,
         "cfg_max_aspect": 3.0,
+        "cfg_min_prominence": 0.14,
         "cfg_min_compactness": 0.16,
         "cfg_min_solidity": 0.58,
         "cfg_cluster_eps": "auto",
@@ -63,6 +65,7 @@ PRESET_VALUES: dict[str, dict[str, object]] = {
         "cfg_min_area_m2": 15.0,
         "cfg_min_extent": 0.30,
         "cfg_max_aspect": 4.5,
+        "cfg_min_prominence": 0.05,
         "cfg_min_compactness": 0.08,
         "cfg_min_solidity": 0.40,
         "cfg_cluster_eps": "auto",
@@ -107,6 +110,7 @@ def current_ui_config_snapshot() -> dict[str, object]:
         "cfg_min_area_m2",
         "cfg_min_extent",
         "cfg_max_aspect",
+        "cfg_min_prominence",
         "cfg_min_compactness",
         "cfg_min_solidity",
         "cfg_cluster_eps",
@@ -238,6 +242,7 @@ def build_cmd(
     min_area_m2: float,
     min_extent: float,
     max_aspect: float,
+    min_prominence: float,
     min_compactness: float,
     min_solidity: float,
     cluster_eps: str,
@@ -271,6 +276,7 @@ def build_cmd(
     cmd += ["--min-area-m2", str(min_area_m2)]
     cmd += ["--min-extent", str(min_extent)]
     cmd += ["--max-aspect", str(max_aspect)]
+    cmd += ["--min-prominence", str(min_prominence)]
     cmd += ["--min-compactness", str(min_compactness)]
     cmd += ["--min-solidity", str(min_solidity)]
 
@@ -476,6 +482,157 @@ def parse_values_used(process_log: str) -> dict:
     return out
 
 
+def _to_float_or_none(value) -> float | None:
+    try:
+        if value is None:
+            return None
+        v = float(value)
+        if pd.isna(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _to_int_or_none(value) -> int | None:
+    try:
+        if value is None:
+            return None
+        v = int(value)
+        return v
+    except Exception:
+        return None
+
+
+def assess_run_quality(used: dict, df: pd.DataFrame | None) -> dict[str, object]:
+    """
+    Heuristic quality badge for triage confidence (not ground truth).
+    """
+    checks: list[tuple[str, bool]] = []
+
+    cand_count = _to_int_or_none(used.get("candidates_kept"))
+    clusters = _to_int_or_none(used.get("clusters_found"))
+    noise = _to_int_or_none(used.get("clusters_noise"))
+    top_score = None
+    median_score = None
+    if df is not None and not df.empty and "score" in df.columns:
+        s = pd.to_numeric(df["score"], errors="coerce").dropna()
+        if not s.empty:
+            top_score = float(s.max())
+            median_score = float(s.median())
+
+    checks.append(("Candidate count in useful review range (8-250)", bool(cand_count is not None and 8 <= cand_count <= 250)))
+    checks.append(("At least one non-noise cluster", bool(clusters is not None and clusters >= 1)))
+    checks.append(("Top score >= 2.0", bool(top_score is not None and top_score >= 2.0)))
+    checks.append(("Median score >= 0.35", bool(median_score is not None and median_score >= 0.35)))
+
+    if clusters is not None and noise is not None and cand_count and cand_count > 0:
+        noise_frac = float(noise) / float(max(1, cand_count))
+        checks.append(("Noise fraction <= 0.70", noise_frac <= 0.70))
+
+    total = len(checks)
+    passed = sum(1 for _, ok in checks if ok)
+    ratio = (float(passed) / float(total)) if total else 0.0
+
+    if ratio >= 0.75:
+        label = "Strong signal"
+        tone = "#0f766e"
+        bg = "#ecfdf5"
+    elif ratio >= 0.45:
+        label = "Moderate signal"
+        tone = "#b45309"
+        bg = "#fffbeb"
+    else:
+        label = "Weak / noisy signal"
+        tone = "#b91c1c"
+        bg = "#fef2f2"
+
+    return {
+        "label": label,
+        "tone": tone,
+        "bg": bg,
+        "passed": passed,
+        "total": total,
+        "checks": checks,
+        "candidate_count": cand_count,
+        "clusters": clusters,
+        "noise": noise,
+        "top_score": top_score,
+        "median_score": median_score,
+    }
+
+
+def build_provenance_text(
+    *,
+    run_dir: Path,
+    command: list[str] | None,
+    used: dict,
+    run_params_data: dict | None,
+    preset_name: str | None,
+    preset_match: bool | None,
+) -> str:
+    lines: list[str] = []
+    lines.append(f"run_dir={run_dir}")
+    if run_params_data and isinstance(run_params_data, dict):
+        ts = run_params_data.get("timestamp_utc")
+        if ts:
+            lines.append(f"timestamp_utc={ts}")
+        input_path = run_params_data.get("input_path")
+        if input_path:
+            lines.append(f"input={input_path}")
+    lines.append(f"ui_preset_selected={preset_name or 'unknown'}")
+    lines.append(f"ui_preset_match={preset_match}")
+
+    if used:
+        lines.append(f"resolved_pos_thresh_m={used.get('pos_thresh_m')}")
+        lines.append(f"resolved_pos_thresh_spec={used.get('pos_thresh_spec')}")
+        lines.append(f"resolved_min_density={used.get('min_density')}")
+        lines.append(f"resolved_min_density_spec={used.get('min_density_spec')}")
+        lines.append(f"resolved_dbscan_eps_m={used.get('dbscan_eps_m')}")
+        lines.append(f"resolved_dbscan_min_samples={used.get('dbscan_min_samples')}")
+        lines.append(f"resolved_candidates_kept={used.get('candidates_kept')}")
+        lines.append(f"resolved_clusters_found={used.get('clusters_found')}")
+        lines.append(f"resolved_clusters_noise={used.get('clusters_noise')}")
+
+    if run_params_data and isinstance(run_params_data, dict):
+        params = run_params_data.get("params")
+        if isinstance(params, dict):
+            for k in sorted(params.keys()):
+                lines.append(f"param.{k}={params[k]}")
+
+    if command:
+        lines.append("command=" + " ".join(command))
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_hint_block(title: str, hints: list[str], *, level: str = "info") -> None:
+    if level == "warning":
+        st.warning(title)
+    elif level == "error":
+        st.error(title)
+    else:
+        st.info(title)
+    st.markdown("\n".join([f"- {h}" for h in hints]))
+
+
+def run_failure_hints(log_text: str) -> list[str]:
+    t = (log_text or "").lower()
+    hints = [
+        "Open the **Run details** tab and check the last error line in logs.",
+        "Try a new run name or enable `Overwrite run folder`.",
+    ]
+    if "pdal" in t and ("not found" in t or "no such file" in t):
+        hints.insert(0, "PDAL appears unavailable; install/verify it (`pdal --version`).")
+    if "input laz/las not found" in t or "input file not found" in t:
+        hints.insert(0, "Input path looks invalid; verify the selected `.laz/.las` file exists.")
+    if "run dir already exists" in t:
+        hints.insert(0, "Run folder already exists; enable overwrite or change run name.")
+    if "dtm has no crs" in t:
+        hints.insert(0, "DTM CRS is missing; confirm source LAS/LAZ has valid georeferencing.")
+    return hints
+
+
 @st.cache_data(show_spinner=False)
 def inline_report_images_and_basemap(report_html_path_str: str, run_dir_str: str, report_mtime_ns: int) -> str:
     """
@@ -585,11 +742,11 @@ def leaflet_map_html(df: pd.DataFrame) -> str:
     - Click a point to see key metrics
     """
     # Keep only what we need (prevents gigantic HTML)
-    cols = [c for c in ["cand_id", "score", "peak_relief_m", "area_m2", "extent", "aspect", "compactness", "solidity", "cluster_id", "lat", "lon"] if c in df.columns]
+    cols = [c for c in ["cand_id", "score", "peak_relief_m", "prominence_m", "area_m2", "extent", "aspect", "compactness", "solidity", "cluster_id", "lat", "lon"] if c in df.columns]
     pts = df[cols].copy()
 
     # Ensure numeric for JS formatting
-    for c in ["score", "peak_relief_m", "area_m2", "extent", "aspect", "compactness", "solidity", "lat", "lon"]:
+    for c in ["score", "peak_relief_m", "prominence_m", "area_m2", "extent", "aspect", "compactness", "solidity", "lat", "lon"]:
         if c in pts.columns:
             pts[c] = pd.to_numeric(pts[c], errors="coerce")
 
@@ -663,6 +820,7 @@ data.forEach(p => {{
       <b>Candidate ${"{p.cand_id}"}</b><br/>
       Score: ${"{fmt(p.score, 3)}"}<br/>
       Peak relief (m): ${"{fmt(p.peak_relief_m, 2)}"}<br/>
+      Prominence (m): ${"{fmt(p.prominence_m, 2)}"}<br/>
       Area (m²): ${"{fmt(p.area_m2, 1)}"}<br/>
       Extent: ${"{fmt(p.extent, 3)}"}<br/>
       Compactness: ${"{fmt(p.compactness, 3)}"}<br/>
@@ -799,6 +957,8 @@ if "last_ui_config" not in st.session_state:
     st.session_state.last_ui_config = None
 if "last_compare_summary" not in st.session_state:
     st.session_state.last_compare_summary = None
+if "cfg_portfolio_mode" not in st.session_state:
+    st.session_state.cfg_portfolio_mode = False
 
 if "cfg_preset" not in st.session_state:
     st.session_state.cfg_preset = PRESET_BALANCED
@@ -806,6 +966,9 @@ if "cfg_pos_thresh" not in st.session_state:
     apply_preset_to_session(st.session_state.cfg_preset)
 if "cfg_preset_prev" not in st.session_state:
     st.session_state.cfg_preset_prev = st.session_state.cfg_preset
+for _k, _v in PRESET_VALUES.get(st.session_state.cfg_preset, PRESET_VALUES[PRESET_BALANCED]).items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
 
 # -----------------------------
@@ -865,6 +1028,11 @@ with st.sidebar:
         "Skip HTML report",
         value=False,
         help="If enabled, MayaScan will not generate report.html or cutout image panels.",
+    )
+    portfolio_mode = st.toggle(
+        "Portfolio mode (clean demo view)",
+        key="cfg_portfolio_mode",
+        help="Hides diagnostics-heavy sections and keeps presentation-focused outputs prominent.",
     )
 
     st.divider()
@@ -969,6 +1137,17 @@ with st.sidebar:
         step=0.1,
         help="Elongation = max(width/height, height/width). High values are long/skinny shapes (often ridges/edges/artifacts).",
     )
+    min_prominence = st.number_input(
+        "Minimum local prominence (m)",
+        min_value=0.0,
+        max_value=5.0,
+        key="cfg_min_prominence",
+        step=0.01,
+        help=(
+            "Prominence compares region mean relief to a surrounding ring. "
+            "Higher values suppress broad background trends and ridge-like artifacts."
+        ),
+    )
     min_compactness = st.number_input(
         "Minimum compactness (0–1)",
         min_value=0.0,
@@ -1023,7 +1202,7 @@ with st.sidebar:
 # -----------------------------
 # Main area: Tabs
 # -----------------------------
-tab_results, tab_runlogs, tab_glossary = st.tabs(["📍 Results", "⚙️ Run details", "📖 Glossary"])
+tab_results, tab_compare, tab_runlogs, tab_glossary = st.tabs(["📍 Results", "📊 Comparison", "⚙️ Run details", "📖 Glossary"])
 
 def resolve_input_and_run():
     st.session_state.last_compare_summary = None
@@ -1063,6 +1242,15 @@ def resolve_input_and_run():
     if errors:
         for e in errors:
             st.error(e)
+        render_hint_block(
+            "Parameter validation failed.",
+            [
+                "Use `auto:pNN` (example: `auto:p96`) or a numeric value.",
+                "For density, numeric values must stay between 0 and 1.",
+                "For cluster radius, use `auto` or a positive number in meters.",
+            ],
+            level="warning",
+        )
         return None, None, None
 
     if cluster_eps_spec.lower() == "auto":
@@ -1088,6 +1276,7 @@ def resolve_input_and_run():
         min_area_m2=float(min_area_m2),
         min_extent=float(min_extent),
         max_aspect=float(max_aspect),
+        min_prominence=float(min_prominence),
         min_compactness=float(min_compactness),
         min_solidity=float(min_solidity),
         cluster_eps=cluster_eps_spec,
@@ -1109,45 +1298,49 @@ def resolve_input_and_run():
     log_lines = []
     with tab_runlogs:
         st.markdown("### Run")
-        st.caption("When finished, switch to **Results** to review the map, candidates, and report.")
-
-        with st.expander("Command", expanded=False):
-            st.code(" ".join(cmd), language="bash")
+        if portfolio_mode:
+            st.caption("Portfolio mode is on. Live diagnostics are hidden for a cleaner presentation.")
+        else:
+            st.caption("When finished, switch to **Results** to review the map, candidates, and report.")
+            with st.expander("Command", expanded=False):
+                st.code(" ".join(cmd), language="bash")
 
         status = st.empty()
         status.info("🏛️ Scanning terrain…")
         progress_bar = st.progress(0.02)
+        log_box = None
+        if not portfolio_mode:
+            with st.expander("Live logs", expanded=True):
+                log_box = st.empty()
 
-        with st.expander("Live logs", expanded=True):
-            log_box = st.empty()
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
 
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(REPO_ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-
-            while True:
-                line = proc.stdout.readline() if proc.stdout else ""
-                if line:
-                    log_lines.append(line.rstrip("\n"))
+        while True:
+            line = proc.stdout.readline() if proc.stdout else ""
+            if line:
+                log_lines.append(line.rstrip("\n"))
+                if log_box is not None:
                     tail = "\n".join(log_lines[-450:])
                     log_box.code(tail, language="text")
-                    step_info = parse_step_from_log_line(line.rstrip("\n"))
-                    if step_info:
-                        step_idx, step_title = step_info
-                        # maya_scan has step 0..7
-                        frac = max(0.05, min(0.95, float(step_idx + 1) / 8.0))
-                        progress_bar.progress(frac)
-                        status.info(f"🏛️ Step {step_idx}: {step_title}")
-                if line == "" and proc.poll() is not None:
-                    break
-                time.sleep(0.01)
+                step_info = parse_step_from_log_line(line.rstrip("\n"))
+                if step_info:
+                    step_idx, step_title = step_info
+                    # maya_scan has step 0..7
+                    frac = max(0.05, min(0.95, float(step_idx + 1) / 8.0))
+                    progress_bar.progress(frac)
+                    status.info(f"🏛️ Step {step_idx}: {step_title}")
+            if line == "" and proc.poll() is not None:
+                break
+            time.sleep(0.01)
 
-            rc = proc.returncode
+        rc = proc.returncode
 
     st.session_state.last_logs = "\n".join(log_lines)
 
@@ -1157,6 +1350,7 @@ def resolve_input_and_run():
             status.success(f"Done ✅  Output folder: {run_dir}")
         else:
             status.error(f"Failed ❌  Exit code: {rc}")
+            render_hint_block("Run failed. Try these fixes:", run_failure_hints(st.session_state.last_logs), level="error")
 
     return run_dir, runs_dir_path, cmd
 
@@ -1197,6 +1391,7 @@ def resolve_and_run_preset_comparison():
             min_area_m2=float(vals["cfg_min_area_m2"]),
             min_extent=float(vals["cfg_min_extent"]),
             max_aspect=float(vals["cfg_max_aspect"]),
+            min_prominence=float(vals["cfg_min_prominence"]),
             min_compactness=float(vals["cfg_min_compactness"]),
             min_solidity=float(vals["cfg_min_solidity"]),
             cluster_eps=str(vals["cfg_cluster_eps"]),
@@ -1220,63 +1415,69 @@ def resolve_and_run_preset_comparison():
 
     with tab_runlogs:
         st.markdown("### Preset comparison")
-        st.caption("Running selected presets on the same input tile.")
-
-        with st.expander("Commands", expanded=False):
-            for spec in run_specs:
-                st.code(" ".join(spec["cmd"]), language="bash")
+        if portfolio_mode:
+            st.caption("Portfolio mode is on. Live diagnostics are hidden for a cleaner presentation.")
+        else:
+            st.caption("Running selected presets on the same input tile.")
+            with st.expander("Commands", expanded=False):
+                for spec in run_specs:
+                    st.code(" ".join(spec["cmd"]), language="bash")
 
         status = st.empty()
         progress_bar = st.progress(0.02)
-        with st.expander("Live logs", expanded=True):
-            log_box = st.empty()
+        log_box = None
+        if not portfolio_mode:
+            with st.expander("Live logs", expanded=True):
+                log_box = st.empty()
 
-            for i, spec in enumerate(run_specs):
-                preset_i = str(spec["preset"])
-                cmd_i = spec["cmd"]
-                run_dir_i = Path(spec["run_dir"])
-                status.info(f"🏛️ Running {preset_i} ({i + 1}/{n})...")
+        for i, spec in enumerate(run_specs):
+            preset_i = str(spec["preset"])
+            cmd_i = spec["cmd"]
+            run_dir_i = Path(spec["run_dir"])
+            status.info(f"🏛️ Running {preset_i} ({i + 1}/{n})...")
 
-                proc = subprocess.Popen(
-                    cmd_i,
-                    cwd=str(REPO_ROOT),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                )
+            proc = subprocess.Popen(
+                cmd_i,
+                cwd=str(REPO_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
 
-                while True:
-                    line = proc.stdout.readline() if proc.stdout else ""
-                    if line:
-                        msg = line.rstrip("\n")
-                        log_lines.append(f"[{preset_i}] {msg}")
+            while True:
+                line = proc.stdout.readline() if proc.stdout else ""
+                if line:
+                    msg = line.rstrip("\n")
+                    log_lines.append(f"[{preset_i}] {msg}")
+                    if log_box is not None:
                         tail = "\n".join(log_lines[-450:])
                         log_box.code(tail, language="text")
-                        step_info = parse_step_from_log_line(msg)
-                        if step_info:
-                            step_idx, step_title = step_info
-                            local_frac = max(0.02, min(0.98, float(step_idx + 1) / 8.0))
-                            global_frac = ((i + local_frac) / n)
-                            progress_bar.progress(max(0.02, min(0.99, global_frac)))
-                            status.info(f"🏛️ {preset_i}: Step {step_idx} - {step_title}")
-                    if line == "" and proc.poll() is not None:
-                        break
-                    time.sleep(0.01)
+                    step_info = parse_step_from_log_line(msg)
+                    if step_info:
+                        step_idx, step_title = step_info
+                        local_frac = max(0.02, min(0.98, float(step_idx + 1) / 8.0))
+                        global_frac = ((i + local_frac) / n)
+                        progress_bar.progress(max(0.02, min(0.99, global_frac)))
+                        status.info(f"🏛️ {preset_i}: Step {step_idx} - {step_title}")
+                if line == "" and proc.poll() is not None:
+                    break
+                time.sleep(0.01)
 
-                rc = proc.returncode
-                if rc != 0:
-                    st.session_state.last_logs = "\n".join(log_lines)
-                    st.session_state.last_cmd = cmd_i
-                    st.session_state.last_compare_summary = None
-                    status.error(f"Failed ❌  {preset_i} exited with code {rc}.")
-                    return None
+            rc = proc.returncode
+            if rc != 0:
+                st.session_state.last_logs = "\n".join(log_lines)
+                st.session_state.last_cmd = cmd_i
+                st.session_state.last_compare_summary = None
+                status.error(f"Failed ❌  {preset_i} exited with code {rc}.")
+                render_hint_block("Preset comparison failed. Try these fixes:", run_failure_hints(st.session_state.last_logs), level="error")
+                return None
 
-                s = read_run_summary(run_dir_i)
-                s["preset"] = preset_i
-                s["run_name"] = str(spec["run_name"])
-                run_summaries.append(s)
-                progress_bar.progress(max(0.02, min(0.99, float(i + 1) / n)))
+            s = read_run_summary(run_dir_i)
+            s["preset"] = preset_i
+            s["run_name"] = str(spec["run_name"])
+            run_summaries.append(s)
+            progress_bar.progress(max(0.02, min(0.99, float(i + 1) / n)))
 
         progress_bar.progress(1.0)
         status.success("Preset comparison complete ✅")
@@ -1345,63 +1546,29 @@ with tab_results:
 
     compare_summary = st.session_state.get("last_compare_summary")
     if compare_summary:
-        st.markdown("#### Preset comparison summary")
-        baseline = compare_summary.get("baseline_preset")
-        if baseline:
-            st.caption(f"Baseline preset: {baseline}")
-
-        rows = compare_summary.get("runs", [])
-        if isinstance(rows, list) and rows:
-            cmp_df = pd.DataFrame(rows)
-            show_cols = [
-                c for c in [
-                    "preset",
-                    "run_name",
-                    "candidates",
-                    "clusters",
-                    "noise",
-                    "top_score",
-                    "mean_score",
-                    "median_score",
-                    "d_candidates_vs_baseline",
-                    "d_top_score_vs_baseline",
-                ]
-                if c in cmp_df.columns
-            ]
-            if show_cols:
-                st.dataframe(cmp_df[show_cols], use_container_width=True)
-
-        cjson = compare_summary.get("comparison_json")
-        cmd = compare_summary.get("comparison_md")
-        d1, d2 = st.columns(2)
-        with d1:
-            if cjson:
-                p = Path(str(cjson))
-                if p.exists():
-                    st.download_button(
-                        "Download comparison JSON",
-                        data=p.read_bytes(),
-                        file_name=p.name,
-                        mime="application/json",
-                    )
-        with d2:
-            if cmd:
-                p = Path(str(cmd))
-                if p.exists():
-                    st.download_button(
-                        "Download comparison markdown",
-                        data=p.read_bytes(),
-                        file_name=p.name,
-                        mime="text/markdown",
-                    )
-        st.divider()
+        st.caption("Preset comparison results are available in the **Comparison** tab.")
 
     if not st.session_state.last_run_dir:
-        st.info("Run MayaScan from the sidebar to see results here.")
+        render_hint_block(
+            "No run loaded yet.",
+            [
+                "Choose a LAZ/LAS source in the sidebar.",
+                "Pick a scientific preset (Balanced is recommended to start).",
+                "Click `Run MayaScan` and return here for map, rankings, and exports.",
+            ],
+        )
     else:
         run_dir = Path(st.session_state.last_run_dir)
         if not run_dir.exists():
-            st.warning(f"Last run folder not found: {run_dir}")
+            render_hint_block(
+                f"Run folder not found: {run_dir}",
+                [
+                    "Load an existing run from the sidebar dropdown.",
+                    "Or run a new job with a fresh run name.",
+                    "If this happened after cleanup, regenerate outputs with `Run MayaScan`.",
+                ],
+                level="warning",
+            )
         else:
             # Wait briefly for pipeline outputs to fully land
             wait_for_file(run_dir / "candidates.csv", timeout_s=6.0)
@@ -1409,6 +1576,30 @@ with tab_results:
 
             process_log = read_text_safely(run_dir / "process.log")
             used = parse_values_used(process_log)
+            run_params_path = run_dir / "run_params.json"
+            run_params_data: dict | None = None
+            if run_params_path.exists():
+                try:
+                    parsed = json.loads(run_params_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed, dict):
+                        run_params_data = parsed
+                except Exception:
+                    run_params_data = None
+
+            df = load_candidates(run_dir)
+            quality = assess_run_quality(used, df)
+            st.markdown(
+                (
+                    "<div style='display:inline-block; padding:6px 12px; border-radius:999px; "
+                    f"font-weight:700; color:{quality['tone']}; background:{quality['bg']}; border:1px solid {quality['tone']}22;'>"
+                    f"Run quality: {quality['label']} ({quality['passed']}/{quality['total']} checks)</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            with st.expander("Quality rationale", expanded=False):
+                for label, ok in quality["checks"]:
+                    st.write(f"{'✅' if ok else '⚠️'} {label}")
+                st.caption("This is a triage heuristic for review confidence, not archaeological validation.")
 
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Candidates", used.get("candidates_kept", "—"))
@@ -1425,48 +1616,60 @@ with tab_results:
                     f"cluster_eps={used.get('dbscan_eps_m','—')} m."
                 )
 
-            with st.expander("Run settings used", expanded=False):
-                settings_data: dict[str, object] = {"run_dir": str(run_dir)}
-                settings_data["ui_preset_selected"] = st.session_state.get("last_preset_selected")
-                settings_data["ui_preset_match"] = st.session_state.get("last_preset_match")
-                if st.session_state.last_cmd:
-                    settings_data["command"] = parse_cmd_settings(st.session_state.last_cmd)
-                if st.session_state.get("last_ui_config"):
-                    settings_data["ui_config_snapshot"] = st.session_state["last_ui_config"]
+            if not portfolio_mode:
+                with st.expander("Run settings used", expanded=False):
+                    settings_data: dict[str, object] = {"run_dir": str(run_dir)}
+                    settings_data["ui_preset_selected"] = st.session_state.get("last_preset_selected")
+                    settings_data["ui_preset_match"] = st.session_state.get("last_preset_match")
+                    if st.session_state.last_cmd:
+                        settings_data["command"] = parse_cmd_settings(st.session_state.last_cmd)
+                    if st.session_state.get("last_ui_config"):
+                        settings_data["ui_config_snapshot"] = st.session_state["last_ui_config"]
 
-                run_params_path = run_dir / "run_params.json"
-                if run_params_path.exists():
-                    try:
-                        settings_data["run_params_json"] = json.loads(run_params_path.read_text(encoding="utf-8"))
-                    except Exception:
-                        settings_data["run_params_json"] = "Could not parse run_params.json"
+                    if run_params_data is not None:
+                        settings_data["run_params_json"] = run_params_data
 
-                if used:
-                    settings_data["resolved_from_log"] = {
-                        "relief_threshold_m": used.get("pos_thresh_m"),
-                        "relief_threshold_spec": used.get("pos_thresh_spec"),
-                        "min_density": used.get("min_density"),
-                        "min_density_spec": used.get("min_density_spec"),
-                        "dbscan_eps_m": used.get("dbscan_eps_m"),
-                        "dbscan_min_samples": used.get("dbscan_min_samples"),
-                        "candidates_kept": used.get("candidates_kept"),
-                        "clusters_found": used.get("clusters_found"),
-                        "clusters_noise": used.get("clusters_noise"),
-                    }
+                    if used:
+                        settings_data["resolved_from_log"] = {
+                            "relief_threshold_m": used.get("pos_thresh_m"),
+                            "relief_threshold_spec": used.get("pos_thresh_spec"),
+                            "min_density": used.get("min_density"),
+                            "min_density_spec": used.get("min_density_spec"),
+                            "dbscan_eps_m": used.get("dbscan_eps_m"),
+                            "dbscan_min_samples": used.get("dbscan_min_samples"),
+                            "candidates_kept": used.get("candidates_kept"),
+                            "clusters_found": used.get("clusters_found"),
+                            "clusters_noise": used.get("clusters_noise"),
+                        }
 
-                report_md_path = run_dir / "report.md"
-                if report_md_path.exists():
-                    m = re.search(r"- Input:\s*`([^`]+)`", read_text_safely(report_md_path))
-                    if m:
-                        settings_data["input"] = m.group(1)
+                    report_md_path = run_dir / "report.md"
+                    if report_md_path.exists():
+                        m = re.search(r"- Input:\s*`([^`]+)`", read_text_safely(report_md_path))
+                        if m:
+                            settings_data["input"] = m.group(1)
 
-                st.json(settings_data)
+                    st.json(settings_data)
+
+            with st.expander("Provenance (copy / paste)", expanded=False):
+                prov_text = build_provenance_text(
+                    run_dir=run_dir,
+                    command=st.session_state.last_cmd,
+                    used=used,
+                    run_params_data=run_params_data,
+                    preset_name=st.session_state.get("last_preset_selected"),
+                    preset_match=st.session_state.get("last_preset_match"),
+                )
+                st.text_area("Provenance block", value=prov_text, height=220, key=f"prov_{run_dir.name}")
+                st.download_button(
+                    "Download provenance.txt",
+                    data=prov_text.encode("utf-8"),
+                    file_name=f"{run_dir.name}_provenance.txt",
+                    mime="text/plain",
+                )
 
             st.divider()
 
-            df = load_candidates(run_dir)
             filtered_df = df
-
             if df is not None and not df.empty:
                 filter_col1, filter_col2 = st.columns(2)
 
@@ -1536,9 +1739,24 @@ with tab_results:
             with res_tabs[0]:
                 if filtered_df is None or filtered_df.empty:
                     if df is not None and not df.empty:
-                        st.info("No candidates match the current filters.")
+                        render_hint_block(
+                            "No candidates match current filters.",
+                            [
+                                "Lower the minimum score slider.",
+                                "Include more clusters (or choose All clusters).",
+                                "If needed, rerun with less strict cleanup thresholds.",
+                            ],
+                        )
                     else:
-                        st.info("No candidates.csv found yet. Run MayaScan to generate candidates.")
+                        render_hint_block(
+                            "No candidates available for this run.",
+                            [
+                                "Open **Run details** to confirm the run completed successfully.",
+                                "Try a less strict preset (`Balanced` or `Exploratory`).",
+                                "Lower `min_peak`, `min_area_m2`, or `min_extent` slightly and rerun.",
+                            ],
+                            level="warning",
+                        )
                 else:
                     st.markdown("#### Candidates map")
                     components.html(leaflet_map_html(filtered_df), height=740, scrolling=False)
@@ -1548,16 +1766,29 @@ with tab_results:
             with res_tabs[1]:
                 if filtered_df is None or filtered_df.empty:
                     if df is not None and not df.empty:
-                        st.info("No candidates match the current filters.")
+                        render_hint_block(
+                            "No candidates match current filters.",
+                            [
+                                "Lower minimum score.",
+                                "Reset cluster filter to All clusters.",
+                            ],
+                        )
                     else:
-                        st.info("No candidates.csv found yet.")
+                        render_hint_block(
+                            "No candidate table found yet.",
+                            [
+                                "Run MayaScan first, then return to Results.",
+                                "If run already finished, check `runs/<run_name>/candidates.csv` exists.",
+                            ],
+                            level="warning",
+                        )
                 else:
                     topn = min(30, len(filtered_df))
                     top = filtered_df.sort_values("score", ascending=False).head(topn).copy()
                     st.dataframe(
                         top[
                             [c for c in [
-                                "cand_id","score","density","peak_relief_m","area_m2","extent","aspect","compactness","solidity","cluster_id","lat","lon"
+                                "cand_id","score","density","peak_relief_m","prominence_m","area_m2","extent","aspect","compactness","solidity","cluster_id","lat","lon"
                             ] if c in top.columns]
                         ],
                         use_container_width=True,
@@ -1593,13 +1824,14 @@ with tab_results:
 
                             selected_row = top_view[top_view["_cand_id_int"] == int(selected_cid)].iloc[0]
                             st.markdown("#### Candidate detail")
-                            d1, d2, d3, d4, d5, d6 = st.columns(6)
+                            d1, d2, d3, d4, d5, d6, d7 = st.columns(7)
                             d1.metric("Score", f"{float(selected_row['score']):.3f}" if "score" in selected_row else "—")
                             d2.metric("Peak relief (m)", f"{float(selected_row['peak_relief_m']):.2f}" if "peak_relief_m" in selected_row else "—")
-                            d3.metric("Area (m²)", f"{float(selected_row['area_m2']):.1f}" if "area_m2" in selected_row else "—")
-                            d4.metric("Extent", f"{float(selected_row['extent']):.3f}" if "extent" in selected_row else "—")
-                            d5.metric("Compactness", f"{float(selected_row['compactness']):.3f}" if "compactness" in selected_row else "—")
-                            d6.metric("Solidity", f"{float(selected_row['solidity']):.3f}" if "solidity" in selected_row else "—")
+                            d3.metric("Prominence (m)", f"{float(selected_row['prominence_m']):.2f}" if "prominence_m" in selected_row else "—")
+                            d4.metric("Area (m²)", f"{float(selected_row['area_m2']):.1f}" if "area_m2" in selected_row else "—")
+                            d5.metric("Extent", f"{float(selected_row['extent']):.3f}" if "extent" in selected_row else "—")
+                            d6.metric("Compactness", f"{float(selected_row['compactness']):.3f}" if "compactness" in selected_row else "—")
+                            d7.metric("Solidity", f"{float(selected_row['solidity']):.3f}" if "solidity" in selected_row else "—")
                             if "cluster_id" in selected_row and pd.notna(selected_row["cluster_id"]):
                                 st.caption(f"Cluster: {int(selected_row['cluster_id'])}")
 
@@ -1617,9 +1849,22 @@ with tab_results:
                                         use_container_width=True,
                                     )
                                 else:
-                                    st.info("No cutout panel found for this candidate (HTML/cutouts may be disabled).")
+                                    render_hint_block(
+                                        "No cutout panel found for this candidate.",
+                                        [
+                                            "Only top-ranked candidates get cutouts.",
+                                            "Increase `Featured candidates (Top N)` and rerun.",
+                                            "Ensure HTML output is enabled (disable `Skip HTML report`).",
+                                        ],
+                                    )
                             else:
-                                st.info("No cutout images folder found for this run.")
+                                render_hint_block(
+                                    "No cutout image folder found for this run.",
+                                    [
+                                        "Enable HTML output and rerun to generate cutouts.",
+                                    ],
+                                    level="warning",
+                                )
 
             # --- Table
             with res_tabs[2]:
@@ -1645,7 +1890,13 @@ with tab_results:
                     else:
                         st.warning("report.html exists but could not be loaded as text.")
                 else:
-                    st.info("No report.html found (you may have disabled HTML output).")
+                    render_hint_block(
+                        "No report.html found for this run.",
+                        [
+                            "You may have enabled `Skip HTML report`.",
+                            "Rerun with HTML enabled to generate interactive report + cutouts.",
+                        ],
+                    )
 
             # --- Files
             with res_tabs[4]:
@@ -1755,24 +2006,144 @@ with tab_results:
 
 
 # -----------------------------
+# Comparison tab
+# -----------------------------
+with tab_compare:
+    st.markdown("### Preset comparison")
+    compare_summary = st.session_state.get("last_compare_summary")
+    if not compare_summary:
+        render_hint_block(
+            "No comparison has been run yet.",
+            [
+                "In the sidebar, choose at least two presets under `Compare presets`.",
+                "Click `Run preset comparison`.",
+                "Return here for side-by-side bars and deltas.",
+            ],
+        )
+    else:
+        baseline = compare_summary.get("baseline_preset")
+        if baseline:
+            st.caption(f"Baseline preset: {baseline}")
+
+        rows = compare_summary.get("runs", [])
+        cmp_df = pd.DataFrame(rows) if isinstance(rows, list) else pd.DataFrame()
+        if cmp_df.empty:
+            st.warning("Comparison payload exists, but run rows are empty.")
+        else:
+            for col in ["candidates", "clusters", "noise", "top_score", "mean_score", "median_score", "d_candidates_vs_baseline", "d_top_score_vs_baseline"]:
+                if col in cmp_df.columns:
+                    cmp_df[col] = pd.to_numeric(cmp_df[col], errors="coerce")
+
+            if "preset" in cmp_df.columns:
+                cmp_df = cmp_df.sort_values("preset")
+
+            st.markdown("#### Visual bars")
+            bar_cols = [c for c in ["candidates", "clusters", "top_score", "mean_score"] if c in cmp_df.columns]
+            if bar_cols and "preset" in cmp_df.columns:
+                st.bar_chart(cmp_df.set_index("preset")[bar_cols], use_container_width=True)
+            else:
+                st.info("No plottable comparison metrics found.")
+
+            if "preset" in cmp_df.columns:
+                st.markdown("#### Delta vs baseline")
+                for _, row in cmp_df.iterrows():
+                    p_name = str(row.get("preset", "preset"))
+                    if baseline and p_name == str(baseline):
+                        continue
+                    with st.expander(f"{p_name} vs baseline", expanded=False):
+                        c1, c2, c3 = st.columns(3)
+                        cand = row.get("candidates")
+                        d_cand = row.get("d_candidates_vs_baseline")
+                        top = row.get("top_score")
+                        d_top = row.get("d_top_score_vs_baseline")
+                        med = row.get("median_score")
+                        c1.metric(
+                            "Candidates",
+                            "—" if pd.isna(cand) else f"{int(cand)}",
+                            None if pd.isna(d_cand) else f"{int(d_cand):+d}",
+                        )
+                        c2.metric(
+                            "Top score",
+                            "—" if pd.isna(top) else f"{float(top):.3f}",
+                            None if pd.isna(d_top) else f"{float(d_top):+.3f}",
+                        )
+                        c3.metric(
+                            "Median score",
+                            "—" if pd.isna(med) else f"{float(med):.3f}",
+                        )
+
+            st.markdown("#### Full comparison table")
+            show_cols = [
+                c for c in [
+                    "preset",
+                    "run_name",
+                    "candidates",
+                    "clusters",
+                    "noise",
+                    "top_score",
+                    "mean_score",
+                    "median_score",
+                    "d_candidates_vs_baseline",
+                    "d_top_score_vs_baseline",
+                ]
+                if c in cmp_df.columns
+            ]
+            if show_cols:
+                st.dataframe(cmp_df[show_cols], use_container_width=True)
+
+        cjson = compare_summary.get("comparison_json")
+        cmd = compare_summary.get("comparison_md")
+        d1, d2 = st.columns(2)
+        with d1:
+            if cjson:
+                p = Path(str(cjson))
+                if p.exists():
+                    st.download_button(
+                        "Download comparison JSON",
+                        data=p.read_bytes(),
+                        file_name=p.name,
+                        mime="application/json",
+                    )
+        with d2:
+            if cmd:
+                p = Path(str(cmd))
+                if p.exists():
+                    st.download_button(
+                        "Download comparison markdown",
+                        data=p.read_bytes(),
+                        file_name=p.name,
+                        mime="text/markdown",
+                    )
+
+
+# -----------------------------
 # Run details tab (show last logs)
 # -----------------------------
 with tab_runlogs:
-    if st.session_state.get("last_compare_summary"):
-        st.markdown("### Last preset comparison")
-        st.json(st.session_state["last_compare_summary"])
-
-    if st.session_state.last_cmd:
-        st.markdown("### Last run")
-        with st.expander("Command", expanded=False):
-            st.code(" ".join(st.session_state.last_cmd), language="bash")
-        with st.expander("Logs", expanded=False):
-            st.code(
-                st.session_state.last_logs[-20000:] if st.session_state.last_logs else "(no logs yet)",
-                language="text",
-            )
+    if portfolio_mode:
+        render_hint_block(
+            "Portfolio mode is enabled.",
+            [
+                "Detailed command and logs are hidden in this mode.",
+                "Disable `Portfolio mode` in the sidebar to inspect diagnostics.",
+            ],
+        )
     else:
-        st.info("Run MayaScan to see details here.")
+        if st.session_state.get("last_compare_summary"):
+            st.markdown("### Last preset comparison")
+            st.json(st.session_state["last_compare_summary"])
+
+        if st.session_state.last_cmd:
+            st.markdown("### Last run")
+            with st.expander("Command", expanded=False):
+                st.code(" ".join(st.session_state.last_cmd), language="bash")
+            with st.expander("Logs", expanded=False):
+                st.code(
+                    st.session_state.last_logs[-20000:] if st.session_state.last_logs else "(no logs yet)",
+                    language="text",
+                )
+        else:
+            st.info("Run MayaScan to see details here.")
 
 
 # -----------------------------
@@ -1809,6 +2180,10 @@ Lower values are more line-like and often correspond to drainage/ridge artifacts
 **Solidity (0–1)**  
 Defined as `Area / ConvexHullArea`.  
 Lower values indicate fragmented/irregular shapes; higher values are more solid footprints.
+
+**Local prominence (m)**  
+Region mean relief minus mean relief of a surrounding ring.  
+Higher values indicate stand-out terrain features against local background.
 
 **Elongation (aspect ratio, ≥1)**  
 How stretched a region is.  
