@@ -61,6 +61,7 @@ Using multi-scale relief analysis and spatial density modeling, MayaScan highlig
 - Settlement clustering using DBSCAN
 - In-app preset comparison (bars + baseline deltas)
 - Run-quality badge + reproducibility provenance block
+- Filter-waterfall diagnostics and candidate score explainability in-app
 - Interactive HTML reports with cutouts and metrics
 - GIS-ready exports (CSV, GeoJSON, KML)
 - Streamlit interface for end-to-end review
@@ -119,6 +120,8 @@ A lightweight Streamlit UI wraps the CLI pipeline so you can upload a `.laz/.las
 - Dedicated **Comparison** tab with visual bars + deltas vs baseline preset
 - Run-quality badge with explicit heuristic checks
 - Copyable/downloadable provenance block for reproducibility
+- Filter waterfall panel (edge/density/shape/spacing drop counts)
+- Candidate score breakdown panel (component-level contribution view)
 - Optional portfolio mode to hide diagnostics-heavy sections
 - Interactive Leaflet map (Street + Satellite basemap toggle, no API keys)
 - Ranked candidates table
@@ -219,6 +222,8 @@ python maya_scan.py \
   --min-area-m2 25 \
   --min-extent 0.38 \
   --max-aspect 3.5 \
+  --edge-buffer-m 10 \
+  --min-spacing-m 15 \
   --min-prominence 0.10 \
   --min-compactness 0.12 \
   --min-solidity 0.50 \
@@ -338,6 +343,8 @@ No API key is required.
   - `--min-area-m2` (m²): drop very small patches
   - `--min-extent` (0–1): keep coherent/filled regions (area / bbox_area)
   - `--max-aspect` (≥1): drop long skinny ridge-like artifacts
+  - `--edge-buffer-m` (m): drop regions near tile boundaries to reduce edge-cut artifacts
+  - `--min-spacing-m` (m): score-ordered de-dup radius between nearby candidate centers
   - `--min-prominence` (m): drop features that do not stand out from local background ring
   - `--min-compactness` (0–1): drop line-like regions (`4πA/P²`)
   - `--min-solidity` (0–1): drop fragmented/irregular regions (`A / hull_area`)
@@ -353,6 +360,7 @@ No API key is required.
 ## Known Limitations
 
 - MayaScan flags terrain anomalies, not confirmed archaeology; expert interpretation is required.
+- Candidate scores are for **relative ranking within a run**, not calibrated archaeological probabilities.
 - False positives can increase in rugged terrain, modern earthworks, or heavily modified agricultural zones.
 - Newer region-level filtering can produce fewer candidates and lower absolute scores than centroid-based filtering; this is expected and often improves ranking stability.
 - Performance depends on point-cloud quality, ground classification quality, and chosen thresholds.

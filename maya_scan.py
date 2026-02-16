@@ -14,7 +14,7 @@ One-file Maya LiDAR pipeline:
 
 Project-goal improvements:
 - Region shape metrics: bbox fill "extent" (area / bbox_area), aspect ratio, width/height (m)
-- Post-filters: min_peak, min_area_m2, min_extent, max_aspect, min_prominence, min_compactness, min_solidity
+- Post-filters: min_peak, min_area_m2, min_extent, max_aspect, edge buffer, min spacing, min_prominence, min_compactness, min_solidity
 - Score supports extent/prominence/compactness/solidity terms
 - Extra plots: extent/aspect/compactness/solidity/prominence histograms
 - Safer out_dir: only delete existing run with --overwrite
@@ -39,6 +39,8 @@ python maya_scan.py \
   --min-area-m2 25 \
   --min-extent 0.38 \
   --max-aspect 3.5 \
+  --edge-buffer-m 10 \
+  --min-spacing-m 15 \
   --min-prominence 0.10 \
   --max-slope-deg 20 \
   --min-compactness 0.12 \
@@ -158,6 +160,8 @@ class Params:
     min_area_m2: float = 25.0              # e.g. 30
     min_extent: float = 0.38               # bbox fill, 0..1 (e.g. 0.35)
     max_aspect: float = 3.5                # width/height or height/width (e.g. 4.0)
+    edge_buffer_m: float = 10.0            # drop regions touching tile edge within this distance
+    min_candidate_spacing_m: float = 15.0  # score-ordered de-dup spacing between candidate centers
     prominence_ring_pixels: int = 6        # ring width (pixels) for local prominence estimate
     min_prominence_m: float = 0.10         # region mean relief - local ring mean relief
     min_compactness: float = 0.12          # 4*pi*A/P^2 in [0,1], lower = line-like
@@ -649,6 +653,10 @@ def _extract_candidate_regions(
                 "cy": cy,
                 "pixels": pix,
                 "area_m2": area_m2,
+                "x0": x0,
+                "x1": x1,
+                "y0": y0,
+                "y1": y1,
                 "peak": peak,
                 "mean": mean,
                 "ring_mean_relief_m": ring_mean_relief_m,
@@ -806,6 +814,49 @@ def project_points_to_meters(
     to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
     x_m, y_m = to_utm.transform(lon, lat)
     return np.array(x_m, dtype="float64"), np.array(y_m, dtype="float64"), utm_crs
+
+
+def dedupe_candidates_by_spacing(
+    candidates: List[Candidate],
+    src_crs: CRS,
+    dtm_transform: Any,
+    min_spacing_m: float,
+) -> Tuple[List[Candidate], int]:
+    """
+    Score-ordered non-maximum suppression by center spacing in meters.
+    Keeps highest-scoring candidate within each local neighborhood.
+    """
+    if min_spacing_m <= 0.0 or len(candidates) < 2:
+        return candidates, 0
+
+    xs_map: List[float] = []
+    ys_map: List[float] = []
+    for c in candidates:
+        x_map, y_map = pix2map_xy(dtm_transform, c.px_y, c.px_x)
+        xs_map.append(float(x_map))
+        ys_map.append(float(y_map))
+
+    xs = np.array(xs_map, dtype="float64")
+    ys = np.array(ys_map, dtype="float64")
+    xs_m, ys_m, _ = project_points_to_meters(src_crs, xs, ys)
+
+    order = np.argsort(np.array([-c.score for c in candidates], dtype="float64"))
+    keep_mask = np.zeros(len(candidates), dtype=bool)
+    kept_idx: List[int] = []
+    spacing2 = float(min_spacing_m * min_spacing_m)
+    dropped = 0
+
+    for idx in order:
+        if kept_idx:
+            d2 = (xs_m[kept_idx] - xs_m[idx]) ** 2 + (ys_m[kept_idx] - ys_m[idx]) ** 2
+            if float(np.min(d2)) < spacing2:
+                dropped += 1
+                continue
+        keep_mask[idx] = True
+        kept_idx.append(int(idx))
+
+    kept = [c for i, c in enumerate(candidates) if bool(keep_mask[i])]
+    return kept, dropped
 
 
 def cluster_candidates_meters(xs_m: np.ndarray, ys_m: np.ndarray, params: Params) -> np.ndarray:
@@ -1181,7 +1232,8 @@ def write_report_md(
     md.append(f"- min_density: **{min_density:.4f}** (spec: `{params.min_density_spec}`)")
     md.append(
         f"- post-filters: min_peak={params.min_peak_relief_m:.2f}m, min_area={params.min_area_m2:.1f}m², "
-        f"min_extent={params.min_extent:.2f}, max_aspect={params.max_aspect:.2f}, min_prominence={params.min_prominence_m:.2f}m, "
+        f"min_extent={params.min_extent:.2f}, max_aspect={params.max_aspect:.2f}, edge_buffer={params.edge_buffer_m:.1f}m, "
+        f"min_spacing={params.min_candidate_spacing_m:.1f}m, min_prominence={params.min_prominence_m:.2f}m, "
         f"min_compactness={params.min_compactness:.2f}, min_solidity={params.min_solidity:.2f}"
     )
     md.append(
@@ -1210,6 +1262,8 @@ def write_report_md(
     md.append("- Extent = **area / bbox_area** (0..1). Higher generally means more coherent/filled region.")
     md.append("- Aspect = max(width/height, height/width). Very large aspect often means linear/noisy ridges.")
     md.append("- Local prominence = **region mean relief - surrounding ring mean relief**. Low values often indicate background trends.")
+    md.append("- Edge buffer drops regions near tile boundaries to reduce edge artifacts.")
+    md.append("- Spacing de-dup keeps highest-score candidate within each local spacing radius.")
     md.append("- Compactness = **4πA/P²** (0..1). Lower values are more line-like and likely false positives.")
     md.append("- Solidity = **area / convex_hull_area** (0..1). Lower values are fragmented/irregular shapes.")
     md.append("- Slope filter uses **region slope q75** (not centroid slope).")
@@ -1276,8 +1330,10 @@ def write_run_params_json(
     src_crs: CRS,
     clustering_crs: Optional[CRS],
     pdal_ver: str,
+    dropped_edge: int,
     dropped_density: int,
     dropped_post: int,
+    dropped_spacing: int,
     candidate_count: int,
 ) -> Path:
     payload: Dict[str, Any] = {
@@ -1292,8 +1348,10 @@ def write_run_params_json(
             "min_density": float(min_density),
         },
         "candidate_accounting": {
+            "dropped_edge_buffer": int(dropped_edge),
             "dropped_density": int(dropped_density),
             "dropped_post_filters": int(dropped_post),
+            "dropped_spacing_dedup": int(dropped_spacing),
             "kept_candidates": int(candidate_count),
         },
         "params": asdict(params),
@@ -1639,6 +1697,8 @@ def main() -> None:
     ap.add_argument("--min-area-m2", type=_arg_nonnegative_float, default=None, help="Min area (m^2) post-filter (e.g. 30)")
     ap.add_argument("--min-extent", type=_arg_unit_interval, default=None, help="Min extent (0..1) post-filter (e.g. 0.35)")
     ap.add_argument("--max-aspect", type=_arg_ge_one_float, default=None, help="Max aspect ratio post-filter (e.g. 4.0)")
+    ap.add_argument("--edge-buffer-m", type=_arg_nonnegative_float, default=None, help="Drop regions near tile edge within this distance (m, default 10)")
+    ap.add_argument("--min-spacing-m", type=_arg_nonnegative_float, default=None, help="Score-ordered minimum spacing between candidates (m, default 15)")
     ap.add_argument("--prominence-ring-pix", type=_arg_positive_int, default=None, help="Ring width (pixels) for local prominence estimate (default 6)")
     ap.add_argument("--min-prominence", type=_arg_nonnegative_float, default=None, help="Min local prominence (m) post-filter (default 0.10)")
     ap.add_argument("--min-compactness", type=_arg_unit_interval, default=None, help="Min compactness 4*pi*A/P^2 (0..1), lower removes line-like shapes")
@@ -1691,6 +1751,10 @@ def main() -> None:
         params.min_extent = args.min_extent
     if args.max_aspect is not None:
         params.max_aspect = args.max_aspect
+    if args.edge_buffer_m is not None:
+        params.edge_buffer_m = args.edge_buffer_m
+    if args.min_spacing_m is not None:
+        params.min_candidate_spacing_m = args.min_spacing_m
     if args.prominence_ring_pix is not None:
         params.prominence_ring_pixels = args.prominence_ring_pix
     if args.min_prominence is not None:
@@ -1800,9 +1864,22 @@ def main() -> None:
     candidates: List[Candidate] = []
     dropped_density = 0
     dropped_post = 0
+    dropped_edge = 0
+    dropped_spacing = 0
+    edge_buffer_pix = int(math.ceil(max(0.0, float(params.edge_buffer_m)) / max(1e-9, float(res_m))))
+    H, W = density_norm.shape
 
     cand_id = 1
     for r in regions:
+        if edge_buffer_pix > 0:
+            x0 = int(r.get("x0", 0))
+            y0 = int(r.get("y0", 0))
+            x1 = int(r.get("x1", W - 1))
+            y1 = int(r.get("y1", H - 1))
+            if x0 <= edge_buffer_pix or y0 <= edge_buffer_pix or x1 >= (W - 1 - edge_buffer_pix) or y1 >= (H - 1 - edge_buffer_pix):
+                dropped_edge += 1
+                continue
+
         dens = float(r.get("density_mean", np.nan))
         if not np.isfinite(dens):
             dropped_density += 1
@@ -1868,8 +1945,20 @@ def main() -> None:
         )
         cand_id += 1
 
+    if candidates and params.min_candidate_spacing_m > 0:
+        candidates, dropped_spacing = dedupe_candidates_by_spacing(
+            candidates=candidates,
+            src_crs=src_crs,
+            dtm_transform=dtm_transform,
+            min_spacing_m=float(params.min_candidate_spacing_m),
+        )
+        for i, c in enumerate(candidates, start=1):
+            c.cand_id = i
+
+    LOG.info("Dropped by edge buffer (%.1f m): %d", params.edge_buffer_m, dropped_edge)
     LOG.info("Dropped by density (region mean < min_density): %d", dropped_density)
     LOG.info("Dropped by post-filters: %d", dropped_post)
+    LOG.info("Dropped by spacing de-dup (%.1f m): %d", params.min_candidate_spacing_m, dropped_spacing)
     LOG.info("Kept candidates after density + post-filters: %d", len(candidates))
 
     LOG.info("Step 3: Clustering + settlement pattern analysis (meters)")
@@ -1947,8 +2036,10 @@ def main() -> None:
         src_crs=src_crs,
         clustering_crs=used_m_crs,
         pdal_ver=pdal_ver,
+        dropped_edge=dropped_edge,
         dropped_density=dropped_density,
         dropped_post=dropped_post,
+        dropped_spacing=dropped_spacing,
         candidate_count=len(candidates),
     )
     LOG.info("Wrote run_params.json: %s", params_json)
