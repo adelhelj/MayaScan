@@ -11,6 +11,7 @@
 - [Overview](#overview)
 - [Responsible Use](#responsible-use)
 - [Project Background](#project-background)
+- [Goal-Focused Design](#goal-focused-design)
 - [What You Get](#what-you-get)
 - [Installation](#installation)
 - [Quick Start (Streamlit App)](#quick-start-streamlit-app)
@@ -57,11 +58,15 @@ Using multi-scale relief analysis and spatial density modeling, MayaScan highlig
 ### Key capabilities
 
 - LAZ/LAS → DTM, LRM, and density surfaces
-- Automated candidate detection and scoring
+- Automated candidate detection with region-level + consensus filtering
+- Scientific scoring with interpretable component terms
 - Settlement clustering using DBSCAN
 - In-app preset comparison (bars + baseline deltas)
 - Run-quality badge + reproducibility provenance block
-- Filter-waterfall diagnostics and candidate score explainability in-app
+- Filter-waterfall diagnostics (edge/consensus/density/post/spacing)
+- Candidate score explainability (component-level contribution view)
+- In-app analyst labeling + label-guided precision metrics
+- Runtime profiling by pipeline stage
 - Interactive HTML reports with cutouts and metrics
 - GIS-ready exports (CSV, GeoJSON, KML)
 - Streamlit interface for end-to-end review
@@ -100,6 +105,17 @@ MayaScan was built to:
 
 ---
 
+## Goal-Focused Design
+
+The core project goal is reducing review time while keeping likely anthropogenic targets near the top. MayaScan focuses on that through:
+- Region-level filtering instead of centroid-only decisions (more stable candidate behavior)
+- Multi-threshold consensus support to suppress one-threshold artifacts
+- Shape + physics constraints (prominence, compactness, solidity, extent, aspect, area bounds)
+- Edge exclusion + spacing de-dup to reduce tile artifacts and duplicate nearby detections
+- Analyst-in-the-loop labeling and score diagnostics to improve review quality over repeated runs
+
+---
+
 ## What You Get
 
 ### Outputs (per run)
@@ -107,10 +123,12 @@ MayaScan was built to:
 - GeoTIFFs (DTM, LRM, density)
 - CSV candidate table (`candidates.csv`)
 - GeoJSON / KML exports (`candidates.geojson`, `candidates.kml`)
-- Reproducibility metadata (`run_params.json`)
+- Reproducibility + diagnostics metadata (`run_params.json`, including candidate accounting + stage runtimes)
 - Plots and histograms (`plots/`)
 - Markdown + optional PDF summary (`report.md`, `report.pdf`)
 - Optional interactive HTML report with map + cutout panels (`report.html`, `html/img/`)
+- Optional analyst labels file from the app (`candidate_labels.csv`)
+- Optional preset-comparison artifacts (`*_preset_compare_*.json`, `*_preset_compare_*.md`)
 
 ### Review UX (Streamlit App)
 
@@ -120,8 +138,10 @@ A lightweight Streamlit UI wraps the CLI pipeline so you can upload a `.laz/.las
 - Dedicated **Comparison** tab with visual bars + deltas vs baseline preset
 - Run-quality badge with explicit heuristic checks
 - Copyable/downloadable provenance block for reproducibility
-- Filter waterfall panel (edge/density/shape/spacing drop counts)
+- Filter waterfall panel (edge/consensus/density/post-filter/spacing drop counts)
+- Automated parameter tuning hints from waterfall outcomes
 - Candidate score breakdown panel (component-level contribution view)
+- Candidate-detail analyst labels (`likely` / `unlikely` / `unknown`) + notes
 - Optional portfolio mode to hide diagnostics-heavy sections
 - Interactive Leaflet map (Street + Satellite basemap toggle, no API keys)
 - Ranked candidates table
@@ -151,11 +171,12 @@ Typical results include:
 - **PDAL installed separately** (system install)
 - `scikit-learn` for DBSCAN clustering (installed by default via `requirements.txt`)
 - `reportlab` for PDF report output (installed by default via `requirements.txt`)
+- `matplotlib` for plots and cutout rendering (installed by default via `requirements.txt`)
 
 Python package minimums in `requirements.txt`:
 - `numpy>=1.23`, `scipy>=1.9`, `pandas>=1.5`
 - `rasterio>=1.3`, `pyproj>=3.4`, `shapely>=2.0`
-- `scikit-learn>=1.2`, `streamlit>=1.30`
+- `scikit-learn>=1.2`, `matplotlib>=3.6`, `reportlab>=3.6`, `streamlit>=1.30`
 
 **PDAL must be installed separately.** Example installs:
 
@@ -186,9 +207,11 @@ streamlit run app.py
 
 Then:
 1. Upload a `.laz/.las` tile (or use a local path)
-2. Set a run name + parameters
+2. Pick a scientific preset (`Balanced` recommended) and set run name
 3. Click **Run MayaScan**
-4. Review map, ranked candidates, report, and downloads in the **Results** tab.
+4. Review map, ranked candidates, filter waterfall, and score breakdown in **Results**
+5. (Optional) Run **Preset comparison** and review deltas in the **Comparison** tab
+6. (Optional) Add analyst labels (`likely` / `unlikely` / `unknown`) to track triage outcomes over time.
 
 Outputs are saved to:
 
@@ -218,8 +241,12 @@ python maya_scan.py \
   --min-density auto:p60 \
   --density-sigma 40 \
   --max-slope-deg 20 \
+  --consensus-percentiles 95,96,97 \
+  --consensus-min-support 2 \
+  --consensus-radius-m 12 \
   --min-peak 0.50 \
   --min-area-m2 25 \
+  --max-area-m2 1200 \
   --min-extent 0.38 \
   --max-aspect 3.5 \
   --edge-buffer-m 10 \
@@ -267,7 +294,12 @@ Connected-component extraction with filters:
 - Region slope limit (q75 of slope values in each region)
 - Morphological cleanup
 
-### 4. Shape Metrics
+### 4. Consensus Support (Optional but enabled by default)
+- Candidate extraction can run across multiple positive-relief percentiles (default: `95,96,97`)
+- Regions are matched across runs by center distance
+- Candidates can be dropped unless they meet minimum support (default: 2)
+
+### 5. Shape + Terrain Metrics
 For each region:
 - Area
 - Peak / mean relief
@@ -278,27 +310,34 @@ For each region:
 - Solidity (`Area / ConvexHullArea`)
 - Width / height (meters)
 
-### 5. Settlement Density Modeling
+### 6. Settlement Density Modeling
 - Binary mound mask
 - Gaussian smoothing
 - Percentile thresholding
 - Region-level density statistics (mean/q75) per candidate region
 
-### 6. Scoring
+### 7. Post-filters + De-duplication
+- Region mean density gate
+- Shape/physics gates (`min_peak`, `min_area`, `max_area`, `min_extent`, `max_aspect`, `min_prominence`, `min_compactness`, `min_solidity`)
+- Edge buffer exclusion
+- Score-ordered spacing de-duplication (local non-maximum suppression in meters)
+
+### 8. Scoring
 
 ```
-score = (density^a) × (peak^b) × (extent^c) × (prominence^d) × (compactness^e) × (solidity^f) × (area^g)
+score = (density^a) × (peak^b) × (extent^c) × (consensus_support^d) × (prominence^e) × (compactness^f) × (solidity^g) × (area^h)
 ```
 
 Where `density` is the **region mean density** (not a single centroid pixel).
+`consensus_support` is how many threshold runs support a region.
 
-### 7. Spatial Clustering
+### 9. Spatial Clustering
 - Meter-based coordinates for clustering/distances (projected CRS is used directly with unit→meter conversion when needed; geographic CRS auto-projects to UTM)
 - DBSCAN clustering
 - Automatic epsilon selection (optional)
 - Distance to cluster core
 
-### 8. Outputs
+### 10. Outputs + Diagnostics
 Produces the run artifacts listed in [What You Get](#what-you-get).
 
 ---
@@ -341,6 +380,7 @@ No API key is required.
 - Shape cleanup filters:
   - `--min-peak` (m): drop tiny terrain wiggles
   - `--min-area-m2` (m²): drop very small patches
+  - `--max-area-m2` (m²): drop very large merged terrain blobs (`0` disables)
   - `--min-extent` (0–1): keep coherent/filled regions (area / bbox_area)
   - `--max-aspect` (≥1): drop long skinny ridge-like artifacts
   - `--edge-buffer-m` (m): drop regions near tile boundaries to reduce edge-cut artifacts
@@ -352,8 +392,17 @@ No API key is required.
 - `--cluster-eps auto` + `--min-samples 4`  
   DBSCAN clustering in **meters** (projected CRS units are converted to meters when needed; geographic CRS auto-projects to UTM). Useful for settlement pattern grouping.
 
-- Score exponents (`--score-extent-exp`, `--score-prominence-exp`, `--score-compactness-exp`, `--score-solidity-exp`, `--score-area-exp`)  
-  Control how strongly extent/prominence/compactness/solidity/area influence ranking.
+- Consensus controls (`--consensus-percentiles`, `--consensus-min-support`, `--consensus-radius-m`, `--no-consensus`)  
+  Reduce threshold-specific one-offs by favoring regions repeatedly detected across nearby percentiles.
+
+- Score exponents (`--score-extent-exp`, `--score-consensus-exp`, `--score-prominence-exp`, `--score-compactness-exp`, `--score-solidity-exp`, `--score-area-exp`)  
+  Control how strongly each component influences rank ordering.
+
+### Score Interpretation
+
+- Treat score as a **within-run prioritization metric**, not a probability of archaeology.
+- In practice, combine score with geometry/context checks (support, prominence, compactness/solidity, cluster context).
+- Higher `consensus_support` and strong shape metrics generally indicate better review priority than isolated high area alone.
 
 ---
 
@@ -361,9 +410,11 @@ No API key is required.
 
 - MayaScan flags terrain anomalies, not confirmed archaeology; expert interpretation is required.
 - Candidate scores are for **relative ranking within a run**, not calibrated archaeological probabilities.
+- Consensus filtering can suppress isolated true positives if configured too strictly.
 - False positives can increase in rugged terrain, modern earthworks, or heavily modified agricultural zones.
 - Newer region-level filtering can produce fewer candidates and lower absolute scores than centroid-based filtering; this is expected and often improves ranking stability.
 - Performance depends on point-cloud quality, ground classification quality, and chosen thresholds.
+- Analyst labels in the app are review metadata, not ground-truth training labels.
 - Current workflow is primarily tuned for single-tile or tile-at-a-time exploratory analysis.
 
 ---
@@ -410,6 +461,10 @@ Tracked in this repository (typical):
 MayaScan/
 ├── maya_scan.py          # CLI pipeline
 ├── app.py                # Streamlit UI (runs the CLI, renders results)
+├── assets/
+│   ├── mayascan_logo.svg
+│   ├── caracol_caana.png
+│   └── aguada_fenix_lidar.png
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
@@ -422,6 +477,10 @@ Generated locally (gitignored):
 
 ```
 runs/
+runs/*/candidate_labels.csv
+runs/*/run_params.json
+runs/*_preset_compare_*.json
+runs/*_preset_compare_*.md
 data/lidar/*.laz
 data/lidar/*.las
 data/lidar/*.tif
@@ -434,7 +493,7 @@ data/lidar/*.tif
 - Multi-tile regional analysis
 - Linear feature detection
 - ML-based classification
-- Parameter auto-tuning
+- Automated parameter tuning from filter diagnostics and analyst labels
 
 ---
 
