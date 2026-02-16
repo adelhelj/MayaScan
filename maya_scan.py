@@ -53,6 +53,7 @@ import html
 import json
 import logging
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -140,6 +141,7 @@ class Params:
     min_region_pixels: int = 20
     morph_open_iters: int = 1
     morph_close_iters: int = 1
+    # Region-level terrain filter: drop regions whose slope q75 exceeds this.
     max_slope_deg: float = 25.0
 
     # Density
@@ -171,6 +173,127 @@ class Params:
     score_density_exp: float = 1.0
     score_peak_exp: float = 1.0
     score_extent_exp: float = 0.35
+
+
+_RUN_NAME_BAD_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_AUTO_PERCENTILE_RE = re.compile(r"^auto:p([0-9]+(?:\.[0-9]+)?)$", re.IGNORECASE)
+
+
+def _parse_float_arg(raw: str, field: str) -> float:
+    try:
+        return float(raw)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"{field} must be a number, got '{raw}'.") from exc
+
+
+def _arg_positive_float(raw: str) -> float:
+    v = _parse_float_arg(raw, "Value")
+    if v <= 0:
+        raise argparse.ArgumentTypeError("Value must be > 0.")
+    return v
+
+
+def _arg_nonnegative_float(raw: str) -> float:
+    v = _parse_float_arg(raw, "Value")
+    if v < 0:
+        raise argparse.ArgumentTypeError("Value must be >= 0.")
+    return v
+
+
+def _arg_unit_interval(raw: str) -> float:
+    v = _parse_float_arg(raw, "Value")
+    if not (0.0 <= v <= 1.0):
+        raise argparse.ArgumentTypeError("Value must be between 0 and 1.")
+    return v
+
+
+def _arg_ge_one_float(raw: str) -> float:
+    v = _parse_float_arg(raw, "Value")
+    if v < 1.0:
+        raise argparse.ArgumentTypeError("Value must be >= 1.")
+    return v
+
+
+def _arg_positive_int(raw: str) -> int:
+    try:
+        v = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"Value must be an integer, got '{raw}'.") from exc
+    if v < 1:
+        raise argparse.ArgumentTypeError("Value must be >= 1.")
+    return v
+
+
+def _arg_nonnegative_int(raw: str) -> int:
+    try:
+        v = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"Value must be an integer, got '{raw}'.") from exc
+    if v < 0:
+        raise argparse.ArgumentTypeError("Value must be >= 0.")
+    return v
+
+
+def _normalized_auto_percentile_spec(raw: str) -> Optional[str]:
+    s = str(raw).strip().lower()
+    m = _AUTO_PERCENTILE_RE.match(s)
+    if not m:
+        return None
+    p = float(m.group(1))
+    if not (0.0 <= p <= 100.0):
+        raise argparse.ArgumentTypeError("Auto percentile must be between 0 and 100 (auto:pXX).")
+    return f"auto:p{p:g}"
+
+
+def _arg_pos_thresh_spec(raw: str) -> str:
+    auto = _normalized_auto_percentile_spec(raw)
+    if auto is not None:
+        return auto
+    _ = _parse_float_arg(str(raw).strip(), "pos-thresh")
+    return str(raw).strip().lower()
+
+
+def _arg_min_density_spec(raw: str) -> str:
+    auto = _normalized_auto_percentile_spec(raw)
+    if auto is not None:
+        return auto
+    v = _parse_float_arg(str(raw).strip(), "min-density")
+    if not (0.0 <= v <= 1.0):
+        raise argparse.ArgumentTypeError("min-density numeric value must be between 0 and 1.")
+    return str(raw).strip().lower()
+
+
+def _arg_cluster_eps_spec(raw: str) -> str:
+    s = str(raw).strip().lower()
+    if s == "auto":
+        return "auto"
+    v = _parse_float_arg(s, "cluster-eps")
+    if v <= 0:
+        raise argparse.ArgumentTypeError("cluster-eps must be > 0 or 'auto'.")
+    return f"{v:g}"
+
+
+def sanitize_run_name(raw: str) -> str:
+    name = str(raw).strip()
+    name = _RUN_NAME_BAD_CHARS_RE.sub("_", name)
+    name = re.sub(r"_+", "_", name)
+    name = name.strip("._-")
+    if not name:
+        raise ValueError("Run name is empty after sanitization.")
+    if name in {".", ".."}:
+        raise ValueError("Run name cannot be '.' or '..'.")
+    return name[:120]
+
+
+def ensure_path_within(parent: Path, child: Path) -> None:
+    try:
+        child.relative_to(parent)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Resolved output path is outside runs-dir.\n"
+            f"runs-dir={parent}\n"
+            f"out-dir={child}"
+        ) from exc
 
 
 # -----------------------------
@@ -341,10 +464,17 @@ def build_multiscale_lrm(dtm: np.ndarray, params: Params) -> np.ndarray:
 
 
 def parse_auto_percentile(spec: str, values: np.ndarray, positive_only: bool = True) -> float:
-    if not spec.startswith("auto:p"):
-        return float(spec)
+    spec_norm = str(spec).strip().lower()
+    if not spec_norm.startswith("auto:p"):
+        return float(spec_norm)
 
-    p = float(spec.split("auto:p", 1)[1])
+    m = _AUTO_PERCENTILE_RE.match(spec_norm)
+    if not m:
+        raise ValueError(f"Invalid auto percentile spec: '{spec}'. Expected auto:pXX.")
+    p = float(m.group(1))
+    if not (0.0 <= p <= 100.0):
+        raise ValueError(f"Auto percentile must be between 0 and 100, got {p}.")
+
     vals = values[np.isfinite(values)]
     if positive_only:
         vals = vals[vals > 0]
@@ -388,6 +518,16 @@ def detect_regions(
     Compute shape metrics per region.
     Returns regions list + pos_thresh used.
     """
+    _, regions, _, pos_thresh = _extract_candidate_regions(lrm, dtm_slope_deg, profile, params)
+    return regions, pos_thresh
+
+
+def _extract_candidate_regions(
+    lrm: np.ndarray,
+    dtm_slope_deg: np.ndarray,
+    profile: Dict[str, Any],
+    params: Params,
+) -> Tuple[np.ndarray, List[Dict[str, Any]], List[int], float]:
     res_m = _res_m_from_profile(profile)
 
     pos_thresh = parse_auto_percentile(params.pos_relief_threshold_spec, lrm, positive_only=True)
@@ -403,7 +543,7 @@ def detect_regions(
     LOG.info("Initial regions: %d", n)
 
     regions: List[Dict[str, Any]] = []
-    kept = 0
+    kept_rids: List[int] = []
 
     for rid in range(1, n + 1):
         region = labeled == rid
@@ -415,11 +555,15 @@ def detect_regions(
         cy = float(ys.mean())
         cx = float(xs.mean())
 
-        iy = int(round(cy))
-        ix = int(round(cx))
-        if 0 <= iy < dtm_slope_deg.shape[0] and 0 <= ix < dtm_slope_deg.shape[1]:
-            if float(dtm_slope_deg[iy, ix]) > params.max_slope_deg:
-                continue
+        slope_vals = dtm_slope_deg[region]
+        slope_vals = slope_vals[np.isfinite(slope_vals)]
+        if slope_vals.size == 0:
+            continue
+        slope_median_deg = float(np.percentile(slope_vals, 50))
+        slope_q75_deg = float(np.percentile(slope_vals, 75))
+        slope_max_deg = float(np.max(slope_vals))
+        if slope_q75_deg > params.max_slope_deg:
+            continue
 
         peak = float(np.nanmax(lrm[region]))
         mean = float(np.nanmean(lrm[region]))
@@ -453,12 +597,15 @@ def detect_regions(
                 "aspect": aspect,
                 "width_m": w_m,
                 "height_m": h_m,
+                "slope_median_deg": slope_median_deg,
+                "slope_q75_deg": slope_q75_deg,
+                "slope_max_deg": slope_max_deg,
             }
         )
-        kept += 1
+        kept_rids.append(rid)
 
-    LOG.info("Filtered regions (after size+slope): %d", kept)
-    return regions, pos_thresh
+    LOG.info("Filtered regions (after size + region-slope q75): %d", len(regions))
+    return labeled, regions, kept_rids, pos_thresh
 
 
 def build_density_from_regions(
@@ -489,81 +636,24 @@ def detect_candidates(
     """
     Convenience wrapper:
     - creates labeled components & regions
+    - adds region-level density stats (mean/q75 over each region footprint)
     - writes density raster from kept regions (size+slope kept)
     - returns regions, density_norm, pos_thresh, min_density
     """
-    res_m = _res_m_from_profile(profile)
-
-    pos_thresh = parse_auto_percentile(params.pos_relief_threshold_spec, lrm, positive_only=True)
-    LOG.info("Positive relief threshold (m): %.4f (spec=%s)", pos_thresh, params.pos_relief_threshold_spec)
-
-    lrm_filled = np.where(np.isfinite(lrm), lrm, 0.0).astype("float32")
-    mask = lrm_filled > float(pos_thresh)
-
-    mask = binary_opening(mask, iterations=params.morph_open_iters)
-    mask = binary_closing(mask, iterations=params.morph_close_iters)
-
-    labeled, n = cc_label(mask)
-    LOG.info("Initial regions: %d", n)
-
-    regions: List[Dict[str, Any]] = []
-    kept_rids: List[int] = []
-
-    for rid in range(1, n + 1):
-        region = labeled == rid
-        pix = int(region.sum())
-        if pix < params.min_region_pixels:
-            continue
-
-        ys, xs = np.where(region)
-        cy = float(ys.mean())
-        cx = float(xs.mean())
-
-        iy = int(round(cy))
-        ix = int(round(cx))
-        if 0 <= iy < dtm_slope_deg.shape[0] and 0 <= ix < dtm_slope_deg.shape[1]:
-            if float(dtm_slope_deg[iy, ix]) > params.max_slope_deg:
-                continue
-
-        peak = float(np.nanmax(lrm[region]))
-        mean = float(np.nanmean(lrm[region]))
-
-        # bbox shape metrics
-        x0 = int(xs.min())
-        x1 = int(xs.max())
-        y0 = int(ys.min())
-        y1 = int(ys.max())
-        w_pix = float((x1 - x0 + 1))
-        h_pix = float((y1 - y0 + 1))
-        w_m = w_pix * res_m
-        h_m = h_pix * res_m
-
-        bbox_area_m2 = max(1e-9, w_m * h_m)
-        area_m2 = pix * res_m * res_m
-
-        extent = float(np.clip(area_m2 / bbox_area_m2, 0.0, 1.0))
-        aspect = float(max(w_m / max(1e-9, h_m), h_m / max(1e-9, w_m)))  # >=1
-
-        regions.append(
-            {
-                "rid": rid,
-                "cx": cx,
-                "cy": cy,
-                "pixels": pix,
-                "area_m2": area_m2,
-                "peak": peak,
-                "mean": mean,
-                "extent": extent,
-                "aspect": aspect,
-                "width_m": w_m,
-                "height_m": h_m,
-            }
-        )
-        kept_rids.append(rid)
-
-    LOG.info("Filtered regions (after size+slope): %d", len(regions))
+    labeled, regions, kept_rids, pos_thresh = _extract_candidate_regions(lrm, dtm_slope_deg, profile, params)
 
     density_norm = build_density_from_regions(labeled, kept_rids, profile, params, out_density_tif)
+
+    for r in regions:
+        rid = int(r["rid"])
+        dens_vals = density_norm[labeled == rid]
+        dens_vals = dens_vals[np.isfinite(dens_vals)]
+        if dens_vals.size == 0:
+            r["density_mean"] = 0.0
+            r["density_q75"] = 0.0
+            continue
+        r["density_mean"] = float(np.mean(dens_vals))
+        r["density_q75"] = float(np.percentile(dens_vals, 75))
 
     min_density = parse_auto_percentile(params.min_density_spec, density_norm, positive_only=False)
     LOG.info("Min density threshold: %.4f (spec=%s)", min_density, params.min_density_spec)
@@ -591,6 +681,33 @@ def _utm_epsg_from_lonlat(lon: float, lat: float) -> int:
     return (32600 + zone) if lat >= 0 else (32700 + zone)
 
 
+def _projected_unit_factor_to_meters(src_crs: CRS) -> Optional[float]:
+    factors: List[float] = []
+    for axis in src_crs.axis_info:
+        fac = getattr(axis, "unit_conversion_factor", None)
+        if fac is None:
+            continue
+        try:
+            val = float(fac)
+        except (TypeError, ValueError):
+            continue
+        if val > 0:
+            factors.append(val)
+
+    if not factors:
+        return None
+
+    first = factors[0]
+    for val in factors[1:]:
+        if not math.isclose(first, val, rel_tol=1e-9, abs_tol=1e-12):
+            LOG.warning(
+                "Projected CRS has mixed axis conversion factors; using first factor %.12g.",
+                first,
+            )
+            break
+    return first
+
+
 def project_points_to_meters(
     src_crs: CRS,
     xs: np.ndarray,
@@ -601,12 +718,20 @@ def project_points_to_meters(
     If src_crs is projected (meters-ish), pass through.
     If geographic (degrees), convert to EPSG:4326 then to UTM based on centroid.
     """
+    xs64 = xs.astype("float64")
+    ys64 = ys.astype("float64")
+
     if src_crs.is_projected:
-        return xs.astype("float64"), ys.astype("float64"), src_crs
+        factor = _projected_unit_factor_to_meters(src_crs)
+        if factor is not None:
+            if math.isclose(factor, 1.0, rel_tol=1e-9, abs_tol=1e-12):
+                return xs64, ys64, src_crs
+            LOG.info("Projected CRS units converted to meters (factor=%.12g).", factor)
+            return xs64 * factor, ys64 * factor, src_crs
+        LOG.warning("Projected CRS unit conversion factor unavailable; reprojecting to UTM for meter distances.")
 
-    lon = xs.astype("float64")
-    lat = ys.astype("float64")
-
+    lon = xs64
+    lat = ys64
     if src_crs.to_epsg() != 4326:
         to_ll = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
         lon, lat = to_ll.transform(lon, lat)
@@ -968,6 +1093,8 @@ def write_report_md(
     md.append("## Notes")
     md.append("- Extent = **area / bbox_area** (0..1). Higher generally means more coherent/filled region.")
     md.append("- Aspect = max(width/height, height/width). Very large aspect often means linear/noisy ridges.")
+    md.append("- Slope filter uses **region slope q75** (not centroid slope).")
+    md.append("- Candidate density uses **region mean density** over each connected region.")
     md.append("- Clustering/distances are done in **meters** (auto-UTM if source CRS is geographic).")
     md.append("- KML ‘All Candidates’ dots have label scale=0 to prevent Google Earth text overload.")
     md.append("")
@@ -1338,77 +1465,85 @@ def main() -> None:
     ap.add_argument("--try-smrf", action="store_true", help="Try PDAL SMRF ground classification before DTM")
 
     # knobs
-    ap.add_argument("--pos-thresh", default=None, help="Override pos relief threshold (e.g. 0.20 or auto:p95)")
-    ap.add_argument("--min-density", default=None, help="Override min density threshold (e.g. 0.10 or auto:p50)")
-    ap.add_argument("--density-sigma", type=float, default=None, help="Override density sigma (pixels)")
+    ap.add_argument("--pos-thresh", type=_arg_pos_thresh_spec, default=None, help="Override pos relief threshold (e.g. 0.20 or auto:p95)")
+    ap.add_argument("--min-density", type=_arg_min_density_spec, default=None, help="Override min density threshold (e.g. 0.10 or auto:p50)")
+    ap.add_argument("--density-sigma", type=_arg_positive_float, default=None, help="Override density sigma (pixels)")
 
     # post-filters
-    ap.add_argument("--min-peak", type=float, default=None, help="Min peak relief (m) post-filter (e.g. 0.5)")
-    ap.add_argument("--min-area-m2", type=float, default=None, help="Min area (m^2) post-filter (e.g. 30)")
-    ap.add_argument("--min-extent", type=float, default=None, help="Min extent (0..1) post-filter (e.g. 0.35)")
-    ap.add_argument("--max-aspect", type=float, default=None, help="Max aspect ratio post-filter (e.g. 4.0)")
+    ap.add_argument("--min-peak", type=_arg_nonnegative_float, default=None, help="Min peak relief (m) post-filter (e.g. 0.5)")
+    ap.add_argument("--min-area-m2", type=_arg_nonnegative_float, default=None, help="Min area (m^2) post-filter (e.g. 30)")
+    ap.add_argument("--min-extent", type=_arg_unit_interval, default=None, help="Min extent (0..1) post-filter (e.g. 0.35)")
+    ap.add_argument("--max-aspect", type=_arg_ge_one_float, default=None, help="Max aspect ratio post-filter (e.g. 4.0)")
 
     # scoring knobs
-    ap.add_argument("--score-extent-exp", type=float, default=None, help="Exponent for extent in score (default 0.35)")
+    ap.add_argument("--score-extent-exp", type=_arg_nonnegative_float, default=None, help="Exponent for extent in score (default 0.35)")
 
     # clustering knobs
-    ap.add_argument("--cluster-eps", default=None, help="DBSCAN eps in meters or 'auto' (default auto)")
-    ap.add_argument("--min-samples", type=int, default=None, help="DBSCAN min_samples (default 3)")
+    ap.add_argument("--cluster-eps", type=_arg_cluster_eps_spec, default=None, help="DBSCAN eps in meters or 'auto' (default auto)")
+    ap.add_argument("--min-samples", type=_arg_positive_int, default=None, help="DBSCAN min_samples (default 3)")
 
-    ap.add_argument("--label-top-n", type=int, default=None, help="Override KML labeled top-N")
-    ap.add_argument("--report-top-n", type=int, default=None, help="Override report top-N table size")
+    ap.add_argument("--label-top-n", type=_arg_nonnegative_int, default=None, help="Override KML labeled top-N")
+    ap.add_argument("--report-top-n", type=_arg_nonnegative_int, default=None, help="Override report top-N table size")
 
     # HTML / cutouts
     ap.add_argument("--no-html", action="store_true", help="Disable HTML report + cutout images")
-    ap.add_argument("--cutout-size-m", type=float, default=None, help="Cutout panel window size in meters (default 140)")
-    ap.add_argument("--cutout-top-n", type=int, default=None, help="How many top candidates get cutouts (default report_top_n)")
+    ap.add_argument("--cutout-size-m", type=_arg_positive_float, default=None, help="Cutout panel window size in meters (default 140)")
+    ap.add_argument("--cutout-top-n", type=_arg_nonnegative_int, default=None, help="How many top candidates get cutouts (default report_top_n)")
 
     args = ap.parse_args()
+
+    try:
+        run_name = sanitize_run_name(args.name)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if run_name != args.name:
+        print(f"Run name sanitized: '{args.name}' -> '{run_name}'", file=sys.stderr)
 
     params = Params()
 
     if args.pos_thresh is not None:
-        params.pos_relief_threshold_spec = str(args.pos_thresh)
+        params.pos_relief_threshold_spec = args.pos_thresh
     if args.min_density is not None:
-        params.min_density_spec = str(args.min_density)
+        params.min_density_spec = args.min_density
     if args.density_sigma is not None:
-        params.density_sigma_pix = float(args.density_sigma)
+        params.density_sigma_pix = args.density_sigma
 
     if args.min_peak is not None:
-        params.min_peak_relief_m = float(args.min_peak)
+        params.min_peak_relief_m = args.min_peak
     if args.min_area_m2 is not None:
-        params.min_area_m2 = float(args.min_area_m2)
+        params.min_area_m2 = args.min_area_m2
     if args.min_extent is not None:
-        params.min_extent = float(args.min_extent)
+        params.min_extent = args.min_extent
     if args.max_aspect is not None:
-        params.max_aspect = float(args.max_aspect)
+        params.max_aspect = args.max_aspect
 
     if args.score_extent_exp is not None:
-        params.score_extent_exp = float(args.score_extent_exp)
+        params.score_extent_exp = args.score_extent_exp
 
     if args.cluster_eps is not None:
-        if str(args.cluster_eps).lower() == "auto":
+        if args.cluster_eps == "auto":
             params.cluster_eps_mode = "auto"
         else:
             params.cluster_eps_mode = "fixed"
             params.cluster_eps_m = float(args.cluster_eps)
 
     if args.min_samples is not None:
-        params.cluster_min_samples = int(args.min_samples)
+        params.cluster_min_samples = args.min_samples
 
     if args.label_top_n is not None:
-        params.kml_label_top_n = int(args.label_top_n)
+        params.kml_label_top_n = args.label_top_n
     if args.report_top_n is not None:
-        params.report_top_n = int(args.report_top_n)
+        params.report_top_n = args.report_top_n
 
     if args.no_html:
         params.html_report = False
     if args.cutout_size_m is not None:
-        params.cutout_size_m = float(args.cutout_size_m)
+        params.cutout_size_m = args.cutout_size_m
 
     input_path = Path(args.input).expanduser().resolve()
     runs_dir = Path(args.runs_dir).expanduser().resolve()
-    out_dir = runs_dir / args.name
+    out_dir = (runs_dir / run_name).resolve()
+    ensure_path_within(runs_dir, out_dir)
 
     if out_dir.exists():
         if not args.overwrite:
@@ -1476,12 +1611,10 @@ def main() -> None:
 
     cand_id = 1
     for r in regions:
-        iy = int(round(r["cy"]))
-        ix = int(round(r["cx"]))
-        if not (0 <= iy < density_norm.shape[0] and 0 <= ix < density_norm.shape[1]):
+        dens = float(r.get("density_mean", np.nan))
+        if not np.isfinite(dens):
+            dropped_density += 1
             continue
-
-        dens = float(density_norm[iy, ix])
         if dens < float(min_density):
             dropped_density += 1
             continue
@@ -1526,7 +1659,7 @@ def main() -> None:
         )
         cand_id += 1
 
-    LOG.info("Dropped by density: %d", dropped_density)
+    LOG.info("Dropped by density (region mean < min_density): %d", dropped_density)
     LOG.info("Dropped by post-filters: %d", dropped_post)
     LOG.info("Kept candidates after density + post-filters: %d", len(candidates))
 
@@ -1577,7 +1710,7 @@ def main() -> None:
     LOG.info("Step 6: Writing reports")
     md_path = write_report_md(
         out_dir=out_dir,
-        run_name=args.name,
+        run_name=run_name,
         input_path=input_path,
         dtm_path=dtm_path,
         lrm_path=lrm_path,
@@ -1599,7 +1732,7 @@ def main() -> None:
         LOG.info("Step 7: Generating HTML report + cutouts")
         generate_candidate_panels(
             out_dir=out_dir,
-            run_name=args.name,
+            run_name=run_name,
             dtm=dtm,
             lrm=lrm,
             params=params,
@@ -1609,7 +1742,7 @@ def main() -> None:
         )
         html_out = write_html_report(
             out_dir=out_dir,
-            run_name=args.name,
+            run_name=run_name,
             input_path=input_path,
             candidates=candidates,
             params=params,
@@ -1618,7 +1751,7 @@ def main() -> None:
         )
         LOG.info("Wrote report.html: %s", html_out)
 
-    update_manifest(runs_dir, args.name, out_dir, input_path)
+    update_manifest(runs_dir, run_name, out_dir, input_path)
 
     LOG.info("DONE. Output folder: %s", out_dir)
     LOG.info("Quick open: %s", kml_path)
