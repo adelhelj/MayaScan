@@ -8,6 +8,7 @@ import zipfile
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Any, Dict
 
 import pandas as pd
 import streamlit as st
@@ -27,8 +28,13 @@ PRESET_VALUES: dict[str, dict[str, object]] = {
         "cfg_min_density": "auto:p60",
         "cfg_density_sigma": 40.0,
         "cfg_max_slope_deg": 20.0,
+        "cfg_consensus_enabled": True,
+        "cfg_consensus_percentiles": "95,96,97",
+        "cfg_consensus_min_support": 2,
+        "cfg_consensus_radius_m": 12.0,
         "cfg_min_peak": 0.50,
         "cfg_min_area_m2": 25.0,
+        "cfg_max_area_m2": 1200.0,
         "cfg_min_extent": 0.38,
         "cfg_max_aspect": 3.5,
         "cfg_edge_buffer_m": 10.0,
@@ -46,8 +52,13 @@ PRESET_VALUES: dict[str, dict[str, object]] = {
         "cfg_min_density": "auto:p65",
         "cfg_density_sigma": 45.0,
         "cfg_max_slope_deg": 18.0,
+        "cfg_consensus_enabled": True,
+        "cfg_consensus_percentiles": "95,96,97",
+        "cfg_consensus_min_support": 2,
+        "cfg_consensus_radius_m": 10.0,
         "cfg_min_peak": 0.60,
         "cfg_min_area_m2": 35.0,
+        "cfg_max_area_m2": 900.0,
         "cfg_min_extent": 0.42,
         "cfg_max_aspect": 3.0,
         "cfg_edge_buffer_m": 12.0,
@@ -65,8 +76,13 @@ PRESET_VALUES: dict[str, dict[str, object]] = {
         "cfg_min_density": "auto:p50",
         "cfg_density_sigma": 35.0,
         "cfg_max_slope_deg": 22.0,
+        "cfg_consensus_enabled": True,
+        "cfg_consensus_percentiles": "94,95,96",
+        "cfg_consensus_min_support": 2,
+        "cfg_consensus_radius_m": 14.0,
         "cfg_min_peak": 0.35,
         "cfg_min_area_m2": 15.0,
+        "cfg_max_area_m2": 1800.0,
         "cfg_min_extent": 0.30,
         "cfg_max_aspect": 4.5,
         "cfg_edge_buffer_m": 8.0,
@@ -112,8 +128,13 @@ def current_ui_config_snapshot() -> dict[str, object]:
         "cfg_min_density",
         "cfg_density_sigma",
         "cfg_max_slope_deg",
+        "cfg_consensus_enabled",
+        "cfg_consensus_percentiles",
+        "cfg_consensus_min_support",
+        "cfg_consensus_radius_m",
         "cfg_min_peak",
         "cfg_min_area_m2",
+        "cfg_max_area_m2",
         "cfg_min_extent",
         "cfg_max_aspect",
         "cfg_edge_buffer_m",
@@ -246,8 +267,13 @@ def build_cmd(
     min_density: str,
     density_sigma: float,
     max_slope_deg: float,
+    consensus_enabled: bool,
+    consensus_percentiles: str,
+    consensus_min_support: int,
+    consensus_radius_m: float,
     min_peak: float,
     min_area_m2: float,
+    max_area_m2: float,
     min_extent: float,
     max_aspect: float,
     edge_buffer_m: float,
@@ -281,9 +307,19 @@ def build_cmd(
         cmd += ["--density-sigma", str(density_sigma)]
     if max_slope_deg is not None:
         cmd += ["--max-slope-deg", str(max_slope_deg)]
+    if not consensus_enabled:
+        cmd += ["--no-consensus"]
+    else:
+        if consensus_percentiles.strip():
+            cmd += ["--consensus-percentiles", consensus_percentiles.strip()]
+        if consensus_min_support is not None:
+            cmd += ["--consensus-min-support", str(consensus_min_support)]
+        if consensus_radius_m is not None:
+            cmd += ["--consensus-radius-m", str(consensus_radius_m)]
 
     cmd += ["--min-peak", str(min_peak)]
     cmd += ["--min-area-m2", str(min_area_m2)]
+    cmd += ["--max-area-m2", str(max_area_m2)]
     cmd += ["--min-extent", str(min_extent)]
     cmd += ["--max-aspect", str(max_aspect)]
     cmd += ["--edge-buffer-m", str(edge_buffer_m)]
@@ -408,7 +444,7 @@ def parse_cmd_settings(cmd: list[str]) -> dict:
     out: dict[str, object] = {}
     if not cmd:
         return out
-    boolean_flags = {"--overwrite", "--try-smrf", "--no-html"}
+    boolean_flags = {"--overwrite", "--try-smrf", "--no-html", "--no-consensus"}
 
     i = 0
     while i < len(cmd):
@@ -480,6 +516,37 @@ def validate_cluster_eps(value: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def parse_consensus_percentiles_csv(value: str) -> tuple[list[float] | None, str | None]:
+    s = value.strip()
+    if not s:
+        return None, "Consensus percentiles: value is required (example: 95,96,97)."
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        return None, "Consensus percentiles: provide comma-separated numbers (example: 95,96,97)."
+
+    vals: list[float] = []
+    for p in parts:
+        try:
+            v = float(p)
+        except Exception:
+            return None, f"Consensus percentiles: invalid number `{p}`."
+        if v < 0.0 or v > 100.0:
+            return None, "Consensus percentiles: each value must be between 0 and 100."
+        vals.append(v)
+
+    uniq: list[float] = []
+    seen: set[float] = set()
+    for v in vals:
+        key = round(v, 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(float(v))
+    if not uniq:
+        return None, "Consensus percentiles: at least one value is required."
+    return uniq, None
+
+
 def zip_run_dir(run_dir: Path, zip_path: Path) -> Path:
     if zip_path.exists():
         zip_path.unlink()
@@ -542,6 +609,10 @@ def parse_values_used(process_log: str) -> dict:
     m = re.search(r"Dropped by edge buffer \([^)]*\):\s*([0-9]+)", process_log)
     if m:
         out["dropped_edge"] = int(m.group(1))
+
+    m = re.search(r"Dropped by consensus support:\s*([0-9]+)", process_log)
+    if m:
+        out["dropped_consensus"] = int(m.group(1))
 
     m = re.search(r"Dropped by density \(region mean < min_density\):\s*([0-9]+)", process_log)
     if m:
@@ -643,6 +714,47 @@ def assess_run_quality(used: dict, df: pd.DataFrame | None) -> dict[str, object]
     }
 
 
+def tuning_hints_from_filter_waterfall(
+    dropped_edge: int | None,
+    dropped_consensus: int | None,
+    dropped_density: int | None,
+    dropped_post: int | None,
+    dropped_spacing: int | None,
+    kept: int | None,
+) -> list[str]:
+    vals = {
+        "edge": int(dropped_edge or 0),
+        "consensus": int(dropped_consensus or 0),
+        "density": int(dropped_density or 0),
+        "post": int(dropped_post or 0),
+        "spacing": int(dropped_spacing or 0),
+        "kept": int(kept or 0),
+    }
+    total = sum(vals.values())
+    if total <= 0:
+        return []
+
+    hints: list[str] = []
+    kept_count = vals["kept"]
+    if kept_count < 8:
+        hints.append("Recall is low. Try easing strictness: lower `min_density`, lower `min_prominence`, or reduce `consensus_min_support`.")
+    elif kept_count > 300:
+        hints.append("Candidate count is very high. Tighten strictness: raise `pos-thresh`, raise `min_density`, or increase `min_compactness`.")
+
+    if vals["consensus"] / total >= 0.35:
+        hints.append("Consensus is dropping many regions. Consider a larger `consensus-radius-m` or lower `consensus-min-support`.")
+    if vals["density"] / total >= 0.35:
+        hints.append("Density gate dominates drops. Lower `min-density` percentile or reduce `density-sigma` for less neighborhood smoothing.")
+    if vals["post"] / total >= 0.45:
+        hints.append("Shape/physics filters dominate. Recheck `min_peak`, `min_extent`, `min_compactness`, `min_solidity`, and area bounds.")
+    if vals["spacing"] / total >= 0.30:
+        hints.append("Spacing de-dup is collapsing nearby points. Lower `min-spacing-m` if you need finer settlement granularity.")
+    if vals["edge"] / total >= 0.30:
+        hints.append("Edge buffer is dropping many regions. Reduce `edge-buffer-m` or process larger tiles with overlap.")
+
+    return hints[:4]
+
+
 def score_breakdown_df(row: pd.Series, run_params_data: dict | None) -> pd.DataFrame | None:
     params = {}
     if isinstance(run_params_data, dict):
@@ -654,6 +766,7 @@ def score_breakdown_df(row: pd.Series, run_params_data: dict | None) -> pd.DataF
         "density": float(params.get("score_density_exp", 1.0)),
         "peak_relief_m": float(params.get("score_peak_exp", 1.0)),
         "extent": float(params.get("score_extent_exp", 0.35)),
+        "consensus_support": float(params.get("score_consensus_exp", 0.40)),
         "prominence_m": float(params.get("score_prominence_exp", 0.75)),
         "compactness": float(params.get("score_compactness_exp", 0.20)),
         "solidity": float(params.get("score_solidity_exp", 0.20)),
@@ -663,6 +776,7 @@ def score_breakdown_df(row: pd.Series, run_params_data: dict | None) -> pd.DataF
         "density": 1e-9,
         "peak_relief_m": 1e-9,
         "extent": 1e-6,
+        "consensus_support": 1.0,
         "prominence_m": 1e-6,
         "compactness": 1e-6,
         "solidity": 1e-6,
@@ -672,6 +786,7 @@ def score_breakdown_df(row: pd.Series, run_params_data: dict | None) -> pd.DataF
         "density": "density",
         "peak_relief_m": "peak relief (m)",
         "extent": "extent",
+        "consensus_support": "consensus support",
         "prominence_m": "prominence (m)",
         "compactness": "compactness",
         "solidity": "solidity",
@@ -680,7 +795,7 @@ def score_breakdown_df(row: pd.Series, run_params_data: dict | None) -> pd.DataF
 
     rows = []
     est_score = 1.0
-    for key in ["density", "peak_relief_m", "extent", "prominence_m", "compactness", "solidity", "area_m2"]:
+    for key in ["density", "peak_relief_m", "extent", "consensus_support", "prominence_m", "compactness", "solidity", "area_m2"]:
         if key not in row:
             return None
         raw = _to_float_or_none(row.get(key))
@@ -878,6 +993,144 @@ def load_candidates(run_dir: Path) -> pd.DataFrame | None:
         return None
 
 
+def labels_path_for_run(run_dir: Path) -> Path:
+    return run_dir / "candidate_labels.csv"
+
+
+def load_candidate_labels(run_dir: Path) -> pd.DataFrame:
+    path = labels_path_for_run(run_dir)
+    if not path.exists():
+        return pd.DataFrame(columns=["cand_id", "label", "note", "updated_utc", "lat", "lon", "score"])
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame(columns=["cand_id", "label", "note", "updated_utc", "lat", "lon", "score"])
+
+    for col in ["cand_id", "label", "note", "updated_utc", "lat", "lon", "score"]:
+        if col not in df.columns:
+            df[col] = None
+    df["cand_id"] = pd.to_numeric(df["cand_id"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["cand_id"]).copy()
+    df["cand_id"] = df["cand_id"].astype(int)
+    df["label"] = df["label"].astype(str).str.strip().str.lower()
+    valid = {"likely", "unlikely", "unknown"}
+    df = df[df["label"].isin(valid)].copy()
+    return df[["cand_id", "label", "note", "updated_utc", "lat", "lon", "score"]]
+
+
+def upsert_candidate_label(
+    run_dir: Path,
+    cand_id: int,
+    label: str,
+    note: str,
+    lat: float | None = None,
+    lon: float | None = None,
+    score: float | None = None,
+) -> Path:
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    clean_label = str(label).strip().lower()
+    if clean_label not in {"likely", "unlikely", "unknown"}:
+        clean_label = "unknown"
+    clean_note = str(note).strip()
+
+    df = load_candidate_labels(run_dir)
+    row = {
+        "cand_id": int(cand_id),
+        "label": clean_label,
+        "note": clean_note,
+        "updated_utc": now_utc,
+        "lat": lat,
+        "lon": lon,
+        "score": score,
+    }
+
+    if not df.empty and int(cand_id) in set(df["cand_id"].astype(int).tolist()):
+        df.loc[df["cand_id"].astype(int) == int(cand_id), list(row.keys())] = list(row.values())
+    else:
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+
+    path = labels_path_for_run(run_dir)
+    df.sort_values(["cand_id"], inplace=True)
+    df.to_csv(path, index=False)
+    return path
+
+
+def merge_labels_into_candidates(cands_df: pd.DataFrame, labels_df: pd.DataFrame) -> pd.DataFrame:
+    out = cands_df.copy()
+    out["cand_id"] = pd.to_numeric(out["cand_id"], errors="coerce").astype("Int64")
+    out = out.dropna(subset=["cand_id"]).copy()
+    out["cand_id"] = out["cand_id"].astype(int)
+    if labels_df is None or labels_df.empty:
+        out["analyst_label"] = "unknown"
+        out["analyst_note"] = ""
+        out["analyst_updated_utc"] = ""
+        return out
+
+    lbl = labels_df.copy()
+    lbl["cand_id"] = pd.to_numeric(lbl["cand_id"], errors="coerce").astype("Int64")
+    lbl = lbl.dropna(subset=["cand_id"]).copy()
+    lbl["cand_id"] = lbl["cand_id"].astype(int)
+    lbl = lbl.drop_duplicates(subset=["cand_id"], keep="last")
+    lbl = lbl.rename(
+        columns={
+            "label": "analyst_label",
+            "note": "analyst_note",
+            "updated_utc": "analyst_updated_utc",
+        }
+    )
+    out = out.merge(
+        lbl[["cand_id", "analyst_label", "analyst_note", "analyst_updated_utc"]],
+        on="cand_id",
+        how="left",
+    )
+    out["analyst_label"] = out["analyst_label"].fillna("unknown")
+    out["analyst_note"] = out["analyst_note"].fillna("")
+    out["analyst_updated_utc"] = out["analyst_updated_utc"].fillna("")
+    return out
+
+
+def candidate_label_metrics(df: pd.DataFrame) -> Dict[str, Any]:
+    if df is None or df.empty or "analyst_label" not in df.columns:
+        return {}
+
+    mdf = df.copy()
+    mdf["analyst_label"] = mdf["analyst_label"].astype(str).str.lower()
+    labeled = mdf[mdf["analyst_label"].isin(["likely", "unlikely"])].copy()
+    likely_n = int((mdf["analyst_label"] == "likely").sum())
+    unlikely_n = int((mdf["analyst_label"] == "unlikely").sum())
+    unknown_n = int((mdf["analyst_label"] == "unknown").sum())
+
+    metrics: Dict[str, Any] = {
+        "labeled_total": int(len(labeled)),
+        "likely_count": likely_n,
+        "unlikely_count": unlikely_n,
+        "unknown_count": unknown_n,
+    }
+
+    denom = max(1, likely_n + unlikely_n)
+    if likely_n + unlikely_n > 0:
+        metrics["analyst_precision"] = float(likely_n / denom)
+        metrics["analyst_false_positive_rate"] = float(unlikely_n / denom)
+
+    if "score" in mdf.columns:
+        mdf["score"] = pd.to_numeric(mdf["score"], errors="coerce")
+        mdf = mdf.sort_values("score", ascending=False)
+        p_at_k: Dict[str, float] = {}
+        coverage_at_k: Dict[str, float] = {}
+        for k in (5, 10, 20):
+            topk = mdf.head(min(k, len(mdf))).copy()
+            if topk.empty:
+                continue
+            topk_labeled = topk[topk["analyst_label"].isin(["likely", "unlikely"])]
+            if topk_labeled.empty:
+                continue
+            p_at_k[f"p_at_{k}"] = float((topk_labeled["analyst_label"] == "likely").mean())
+            coverage_at_k[f"coverage_at_{k}"] = float(len(topk_labeled) / max(1, len(topk)))
+        metrics.update(p_at_k)
+        metrics.update(coverage_at_k)
+    return metrics
+
+
 # -----------------------------
 # Leaflet map (no Mapbox token needed)
 # -----------------------------
@@ -889,11 +1142,11 @@ def leaflet_map_html(df: pd.DataFrame) -> str:
     - Click a point to see key metrics
     """
     # Keep only what we need (prevents gigantic HTML)
-    cols = [c for c in ["cand_id", "score", "peak_relief_m", "prominence_m", "area_m2", "extent", "aspect", "compactness", "solidity", "cluster_id", "lat", "lon"] if c in df.columns]
+    cols = [c for c in ["cand_id", "score", "peak_relief_m", "consensus_support", "prominence_m", "area_m2", "extent", "aspect", "compactness", "solidity", "cluster_id", "analyst_label", "lat", "lon"] if c in df.columns]
     pts = df[cols].copy()
 
     # Ensure numeric for JS formatting
-    for c in ["score", "peak_relief_m", "prominence_m", "area_m2", "extent", "aspect", "compactness", "solidity", "lat", "lon"]:
+    for c in ["score", "peak_relief_m", "consensus_support", "prominence_m", "area_m2", "extent", "aspect", "compactness", "solidity", "lat", "lon"]:
         if c in pts.columns:
             pts[c] = pd.to_numeric(pts[c], errors="coerce")
 
@@ -967,13 +1220,15 @@ data.forEach(p => {{
       <b>Candidate ${"{p.cand_id}"}</b><br/>
       Score: ${"{fmt(p.score, 3)}"}<br/>
       Peak relief (m): ${"{fmt(p.peak_relief_m, 2)}"}<br/>
+      Consensus support: ${"{fmt(p.consensus_support, 0)}"}<br/>
       Prominence (m): ${"{fmt(p.prominence_m, 2)}"}<br/>
       Area (m²): ${"{fmt(p.area_m2, 1)}"}<br/>
       Extent: ${"{fmt(p.extent, 3)}"}<br/>
       Compactness: ${"{fmt(p.compactness, 3)}"}<br/>
       Solidity: ${"{fmt(p.solidity, 3)}"}<br/>
       Elongation: ${"{fmt(p.aspect, 2)}"}<br/>
-      Cluster: ${"{cid}"}
+      Cluster: ${"{cid}"}<br/>
+      Analyst label: ${"{p.analyst_label ?? 'unknown'}"}
     `;
 
   marker.bindPopup(popup);
@@ -1271,6 +1526,38 @@ with st.sidebar:
             "Lower values suppress steep-slope artifacts."
         ),
     )
+    consensus_enabled = st.checkbox(
+        "Enable multi-threshold consensus",
+        key="cfg_consensus_enabled",
+        help=(
+            "Runs candidate extraction across multiple positive-relief thresholds and keeps regions "
+            "supported by repeated detections."
+        ),
+    )
+    consensus_percentiles = st.text_input(
+        "Consensus relief percentiles (comma-separated)",
+        key="cfg_consensus_percentiles",
+        disabled=not consensus_enabled,
+        help="Example: `95,96,97`.",
+    )
+    consensus_min_support = st.number_input(
+        "Consensus minimum support",
+        min_value=1,
+        max_value=10,
+        key="cfg_consensus_min_support",
+        step=1,
+        disabled=not consensus_enabled,
+        help="Minimum number of threshold runs that must support a candidate region.",
+    )
+    consensus_radius_m = st.number_input(
+        "Consensus match radius (m)",
+        min_value=0.0,
+        max_value=100.0,
+        key="cfg_consensus_radius_m",
+        step=1.0,
+        disabled=not consensus_enabled,
+        help="Center-distance radius used to match detections across threshold runs.",
+    )
 
     st.divider()
     st.markdown("### 5) Shape cleanup (remove noise-like shapes)")
@@ -1289,6 +1576,17 @@ with st.sidebar:
         key="cfg_min_area_m2",
         step=1.0,
         help="Drops very small candidate patches (area in square meters).",
+    )
+    max_area_m2 = st.number_input(
+        "Maximum footprint area (m²)",
+        min_value=0.0,
+        max_value=50000.0,
+        key="cfg_max_area_m2",
+        step=10.0,
+        help=(
+            "Drops very large regions that are often broad terrain trends, ridges, or merged artifacts. "
+            "Set to 0 to disable."
+        ),
     )
     min_extent = st.number_input(
         "Minimum extent (0–1)",
@@ -1412,6 +1710,7 @@ def resolve_input_and_run():
     pos_thresh_spec = pos_thresh.strip()
     min_density_spec = min_density.strip()
     cluster_eps_spec = cluster_eps.strip()
+    consensus_percentiles_spec = str(consensus_percentiles).strip()
 
     errors: list[str] = []
     ok, err = validate_auto_or_numeric(
@@ -1435,6 +1734,18 @@ def resolve_input_and_run():
     if not ok and err:
         errors.append(err)
 
+    consensus_vals: list[float] | None = None
+    if consensus_enabled:
+        consensus_vals, err = parse_consensus_percentiles_csv(consensus_percentiles_spec)
+        if err:
+            errors.append(err)
+        if int(consensus_min_support) < 1:
+            errors.append("Consensus minimum support must be >= 1.")
+        if float(consensus_radius_m) < 0.0:
+            errors.append("Consensus match radius (m) must be >= 0.")
+    if float(max_area_m2) > 0.0 and float(max_area_m2) < float(min_area_m2):
+        errors.append("Maximum footprint area (m²) must be >= minimum footprint area, or 0 to disable.")
+
     if errors:
         for e in errors:
             st.error(e)
@@ -1444,6 +1755,7 @@ def resolve_input_and_run():
                 "Use `auto:pNN` (example: `auto:p96`) or a numeric value.",
                 "For density, numeric values must stay between 0 and 1.",
                 "For cluster radius, use `auto` or a positive number in meters.",
+                "For consensus percentiles, use comma-separated values in [0,100] (example: `95,96,97`).",
             ],
             level="warning",
         )
@@ -1451,6 +1763,8 @@ def resolve_input_and_run():
 
     if cluster_eps_spec.lower() == "auto":
         cluster_eps_spec = "auto"
+    if consensus_enabled and consensus_vals is not None:
+        consensus_percentiles_spec = ",".join(f"{v:g}" for v in consensus_vals)
 
     input_path = resolve_input_path(mode, uploaded, input_local)
     if input_path is None:
@@ -1477,8 +1791,13 @@ def resolve_input_and_run():
         min_density=min_density_spec,
         density_sigma=float(density_sigma),
         max_slope_deg=float(max_slope_deg),
+        consensus_enabled=bool(consensus_enabled),
+        consensus_percentiles=consensus_percentiles_spec,
+        consensus_min_support=int(consensus_min_support),
+        consensus_radius_m=float(consensus_radius_m),
         min_peak=float(min_peak),
         min_area_m2=float(min_area_m2),
+        max_area_m2=float(max_area_m2),
         min_extent=float(min_extent),
         max_aspect=float(max_aspect),
         edge_buffer_m=float(edge_buffer_m),
@@ -1605,8 +1924,13 @@ def resolve_and_run_preset_comparison(selected_compare_presets: list[str]):
             min_density=str(vals["cfg_min_density"]),
             density_sigma=float(vals["cfg_density_sigma"]),
             max_slope_deg=float(vals["cfg_max_slope_deg"]),
+            consensus_enabled=bool(vals["cfg_consensus_enabled"]),
+            consensus_percentiles=str(vals["cfg_consensus_percentiles"]),
+            consensus_min_support=int(vals["cfg_consensus_min_support"]),
+            consensus_radius_m=float(vals["cfg_consensus_radius_m"]),
             min_peak=float(vals["cfg_min_peak"]),
             min_area_m2=float(vals["cfg_min_area_m2"]),
+            max_area_m2=float(vals["cfg_max_area_m2"]),
             min_extent=float(vals["cfg_min_extent"]),
             max_aspect=float(vals["cfg_max_aspect"]),
             edge_buffer_m=float(vals["cfg_edge_buffer_m"]),
@@ -1811,8 +2135,11 @@ with tab_results:
                 except Exception:
                     run_params_data = None
 
-            df = load_candidates(run_dir)
+            labels_df = load_candidate_labels(run_dir)
+            df_loaded = load_candidates(run_dir)
+            df = merge_labels_into_candidates(df_loaded, labels_df) if df_loaded is not None else None
             quality = assess_run_quality(used, df)
+            label_metrics = candidate_label_metrics(df if df is not None else pd.DataFrame())
             st.markdown(
                 (
                     "<div style='display:inline-block; padding:6px 12px; border-radius:999px; "
@@ -1833,6 +2160,31 @@ with tab_results:
             c4.metric("Cluster radius used (m)", used.get("dbscan_eps_m", "—"))
             c5.metric("Clusters", used.get("clusters_found", "—"))
 
+            if label_metrics:
+                l1, l2, l3, l4, l5 = st.columns(5)
+                l1.metric("Likely labels", int(label_metrics.get("likely_count", 0)))
+                l2.metric("Unlikely labels", int(label_metrics.get("unlikely_count", 0)))
+                l3.metric("Unknown labels", int(label_metrics.get("unknown_count", 0)))
+                if "analyst_precision" in label_metrics:
+                    l4.metric("Analyst precision", f"{100.0 * float(label_metrics['analyst_precision']):.1f}%")
+                else:
+                    l4.metric("Analyst precision", "—")
+                if "analyst_false_positive_rate" in label_metrics:
+                    l5.metric("Analyst FPR", f"{100.0 * float(label_metrics['analyst_false_positive_rate']):.1f}%")
+                else:
+                    l5.metric("Analyst FPR", "—")
+                with st.expander("Label-guided score metrics", expanded=False):
+                    rows = []
+                    for k in ("p_at_5", "p_at_10", "p_at_20", "coverage_at_5", "coverage_at_10", "coverage_at_20"):
+                        if k in label_metrics:
+                            rows.append({"metric": k, "value": float(label_metrics[k])})
+                    if rows:
+                        md = pd.DataFrame(rows)
+                        md["value"] = md["value"].map(lambda v: f"{100.0 * float(v):.1f}%")
+                        st.dataframe(md, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("Add labels on candidates to unlock precision@K estimates.")
+
             if used:
                 st.caption(
                     f"Actual values (from process.log): "
@@ -1847,15 +2199,17 @@ with tab_results:
                 if isinstance(acct_raw, dict):
                     acct = acct_raw
             dropped_edge = _to_int_or_none(acct.get("dropped_edge_buffer", used.get("dropped_edge")))
+            dropped_consensus = _to_int_or_none(acct.get("dropped_consensus_support", used.get("dropped_consensus")))
             dropped_density = _to_int_or_none(acct.get("dropped_density", used.get("dropped_density")))
             dropped_post = _to_int_or_none(acct.get("dropped_post_filters", used.get("dropped_post")))
             dropped_spacing = _to_int_or_none(acct.get("dropped_spacing_dedup", used.get("dropped_spacing")))
             kept = _to_int_or_none(acct.get("kept_candidates", used.get("candidates_kept")))
 
-            if any(v is not None for v in [dropped_edge, dropped_density, dropped_post, dropped_spacing, kept]):
+            if any(v is not None for v in [dropped_edge, dropped_consensus, dropped_density, dropped_post, dropped_spacing, kept]):
                 st.markdown("#### Filter waterfall")
                 rows = [
                     {"stage": "Dropped edge", "count": int(dropped_edge or 0)},
+                    {"stage": "Dropped consensus", "count": int(dropped_consensus or 0)},
                     {"stage": "Dropped density", "count": int(dropped_density or 0)},
                     {"stage": "Dropped post-filters", "count": int(dropped_post or 0)},
                     {"stage": "Dropped spacing dedup", "count": int(dropped_spacing or 0)},
@@ -1864,6 +2218,37 @@ with tab_results:
                 wf_df = pd.DataFrame(rows)
                 st.bar_chart(wf_df.set_index("stage"), use_container_width=True)
                 st.caption("Use this to diagnose whether strictness is coming from edge/density/shape/spacing filters.")
+                tuning_hints = tuning_hints_from_filter_waterfall(
+                    dropped_edge=dropped_edge,
+                    dropped_consensus=dropped_consensus,
+                    dropped_density=dropped_density,
+                    dropped_post=dropped_post,
+                    dropped_spacing=dropped_spacing,
+                    kept=kept,
+                )
+                if tuning_hints:
+                    render_hint_block("Tuning suggestions from this run", tuning_hints, level="info")
+
+            stage_metrics_raw = {}
+            if isinstance(run_params_data, dict):
+                sm = run_params_data.get("stage_metrics_sec")
+                if isinstance(sm, dict):
+                    stage_metrics_raw = sm
+            if stage_metrics_raw:
+                stage_rows: list[dict[str, object]] = []
+                for k, v in stage_metrics_raw.items():
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        continue
+                    stage_rows.append({"stage": str(k), "seconds": fv})
+                if stage_rows:
+                    stage_df = pd.DataFrame(stage_rows).sort_values("seconds", ascending=False)
+                    st.markdown("#### Runtime profile")
+                    st.bar_chart(stage_df.set_index("stage")[["seconds"]], use_container_width=True)
+                    total_rt = next((r["seconds"] for r in stage_rows if str(r["stage"]) == "total_runtime_sec"), None)
+                    if isinstance(total_rt, float):
+                        st.caption(f"Total runtime: {total_rt:.2f} sec")
 
             if not portfolio_mode:
                 with st.expander("Run settings used", expanded=False):
@@ -1890,6 +2275,7 @@ with tab_results:
                             "clusters_found": used.get("clusters_found"),
                             "clusters_noise": used.get("clusters_noise"),
                             "dropped_edge": used.get("dropped_edge"),
+                            "dropped_consensus": used.get("dropped_consensus"),
                             "dropped_density": used.get("dropped_density"),
                             "dropped_post": used.get("dropped_post"),
                             "dropped_spacing": used.get("dropped_spacing"),
@@ -1924,7 +2310,7 @@ with tab_results:
 
             filtered_df = df
             if df is not None and not df.empty:
-                filter_col1, filter_col2 = st.columns(2)
+                filter_col1, filter_col2, filter_col3 = st.columns(3)
 
                 min_score_filter: float | None = None
                 with filter_col1:
@@ -1967,6 +2353,55 @@ with tab_results:
                     else:
                         st.caption("No cluster_id column available; cluster filter disabled.")
 
+                selected_labels: list[str] = ["likely", "unlikely", "unknown"]
+                with filter_col3:
+                    if "analyst_label" in df.columns:
+                        label_options = ["likely", "unlikely", "unknown"]
+                        selected_labels = st.multiselect(
+                            "Analyst labels",
+                            options=label_options,
+                            default=label_options,
+                        )
+                    else:
+                        st.caption("No analyst labels yet.")
+
+                min_prominence_filter: float | None = None
+                min_compactness_filter: float | None = None
+                min_solidity_filter: float | None = None
+                shape_col1, shape_col2, shape_col3 = st.columns(3)
+                with shape_col1:
+                    if "prominence_m" in df.columns:
+                        prom_series = pd.to_numeric(df["prominence_m"], errors="coerce").dropna()
+                        if not prom_series.empty:
+                            pmin = float(prom_series.min())
+                            pmax = float(prom_series.max())
+                            min_prominence_filter = st.slider(
+                                "Minimum prominence (m)",
+                                min_value=pmin,
+                                max_value=pmax,
+                                value=pmin,
+                                step=max((pmax - pmin) / 200.0, 0.001),
+                                format="%.3f",
+                            )
+                with shape_col2:
+                    if "compactness" in df.columns:
+                        min_compactness_filter = st.slider(
+                            "Minimum compactness",
+                            min_value=0.0,
+                            max_value=1.0,
+                            value=0.0,
+                            step=0.01,
+                        )
+                with shape_col3:
+                    if "solidity" in df.columns:
+                        min_solidity_filter = st.slider(
+                            "Minimum solidity",
+                            min_value=0.0,
+                            max_value=1.0,
+                            value=0.0,
+                            step=0.01,
+                        )
+
                 filtered_df = df.copy()
                 if min_score_filter is not None and "score" in filtered_df.columns:
                     filtered_df = filtered_df[pd.to_numeric(filtered_df["score"], errors="coerce") >= float(min_score_filter)]
@@ -1975,12 +2410,27 @@ with tab_results:
                     allowed_ids = [cluster_label_to_id[label] for label in selected_cluster_labels if label in cluster_label_to_id]
                     filtered_df = filtered_df[filtered_df["cluster_id"].isin(allowed_ids)]
 
+                if "analyst_label" in filtered_df.columns and selected_labels:
+                    filtered_df = filtered_df[
+                        filtered_df["analyst_label"].astype(str).str.lower().isin([s.lower() for s in selected_labels])
+                    ]
+                elif "analyst_label" in filtered_df.columns and not selected_labels:
+                    filtered_df = filtered_df.iloc[0:0]
+
+                if min_prominence_filter is not None and "prominence_m" in filtered_df.columns:
+                    filtered_df = filtered_df[pd.to_numeric(filtered_df["prominence_m"], errors="coerce") >= float(min_prominence_filter)]
+                if min_compactness_filter is not None and "compactness" in filtered_df.columns:
+                    filtered_df = filtered_df[pd.to_numeric(filtered_df["compactness"], errors="coerce") >= float(min_compactness_filter)]
+                if min_solidity_filter is not None and "solidity" in filtered_df.columns:
+                    filtered_df = filtered_df[pd.to_numeric(filtered_df["solidity"], errors="coerce") >= float(min_solidity_filter)]
+
                 st.caption(f"Showing {len(filtered_df)} of {len(df)} candidates after filters.")
 
             report_html = run_dir / "report.html"
             report_md = run_dir / "report.md"
             run_params_json = run_dir / "run_params.json"
             candidates_csv = run_dir / "candidates.csv"
+            labels_csv = labels_path_for_run(run_dir)
             geojson = run_dir / "candidates.geojson"
             kml = run_dir / "candidates.kml"
             plots_dir = run_dir / "plots"
@@ -2041,7 +2491,7 @@ with tab_results:
                     st.dataframe(
                         top[
                             [c for c in [
-                                "cand_id","score","density","peak_relief_m","prominence_m","area_m2","extent","aspect","compactness","solidity","cluster_id","lat","lon"
+                                "cand_id","score","density","peak_relief_m","consensus_support","prominence_m","area_m2","extent","aspect","compactness","solidity","cluster_id","analyst_label","lat","lon"
                             ] if c in top.columns]
                         ],
                         use_container_width=True,
@@ -2077,14 +2527,15 @@ with tab_results:
 
                             selected_row = top_view[top_view["_cand_id_int"] == int(selected_cid)].iloc[0]
                             st.markdown("#### Candidate detail")
-                            d1, d2, d3, d4, d5, d6, d7 = st.columns(7)
+                            d1, d2, d3, d4, d5, d6, d7, d8 = st.columns(8)
                             d1.metric("Score", f"{float(selected_row['score']):.3f}" if "score" in selected_row else "—")
                             d2.metric("Peak relief (m)", f"{float(selected_row['peak_relief_m']):.2f}" if "peak_relief_m" in selected_row else "—")
-                            d3.metric("Prominence (m)", f"{float(selected_row['prominence_m']):.2f}" if "prominence_m" in selected_row else "—")
-                            d4.metric("Area (m²)", f"{float(selected_row['area_m2']):.1f}" if "area_m2" in selected_row else "—")
-                            d5.metric("Extent", f"{float(selected_row['extent']):.3f}" if "extent" in selected_row else "—")
-                            d6.metric("Compactness", f"{float(selected_row['compactness']):.3f}" if "compactness" in selected_row else "—")
-                            d7.metric("Solidity", f"{float(selected_row['solidity']):.3f}" if "solidity" in selected_row else "—")
+                            d3.metric("Support", f"{int(selected_row['consensus_support'])}" if "consensus_support" in selected_row and pd.notna(selected_row["consensus_support"]) else "—")
+                            d4.metric("Prominence (m)", f"{float(selected_row['prominence_m']):.2f}" if "prominence_m" in selected_row else "—")
+                            d5.metric("Area (m²)", f"{float(selected_row['area_m2']):.1f}" if "area_m2" in selected_row else "—")
+                            d6.metric("Extent", f"{float(selected_row['extent']):.3f}" if "extent" in selected_row else "—")
+                            d7.metric("Compactness", f"{float(selected_row['compactness']):.3f}" if "compactness" in selected_row else "—")
+                            d8.metric("Solidity", f"{float(selected_row['solidity']):.3f}" if "solidity" in selected_row else "—")
                             if "cluster_id" in selected_row and pd.notna(selected_row["cluster_id"]):
                                 st.caption(f"Cluster: {int(selected_row['cluster_id'])}")
 
@@ -2092,6 +2543,39 @@ with tab_results:
                                 lat = float(selected_row["lat"])
                                 lon = float(selected_row["lon"])
                                 st.markdown(f"[Open in Google Maps](https://www.google.com/maps?q={lat:.8f},{lon:.8f})")
+
+                            st.markdown("##### Analyst label")
+                            cur_label = str(selected_row.get("analyst_label", "unknown")).strip().lower()
+                            if cur_label not in {"likely", "unlikely", "unknown"}:
+                                cur_label = "unknown"
+                            cur_note = str(selected_row.get("analyst_note", "") or "")
+                            cur_updated = str(selected_row.get("analyst_updated_utc", "") or "")
+                            label_options = ["unknown", "likely", "unlikely"]
+                            default_idx = label_options.index(cur_label) if cur_label in label_options else 0
+
+                            with st.form(key=f"label_form_{run_dir.name}_{int(selected_cid)}", clear_on_submit=False):
+                                new_label = st.selectbox("Classification", options=label_options, index=default_idx)
+                                new_note = st.text_input("Notes (optional)", value=cur_note, max_chars=500)
+                                save_label = st.form_submit_button("Save label")
+
+                            if cur_updated:
+                                st.caption(f"Last label update: {cur_updated}")
+
+                            if save_label:
+                                lat_v = _to_float_or_none(selected_row.get("lat"))
+                                lon_v = _to_float_or_none(selected_row.get("lon"))
+                                score_v = _to_float_or_none(selected_row.get("score"))
+                                labels_path = upsert_candidate_label(
+                                    run_dir=run_dir,
+                                    cand_id=int(selected_cid),
+                                    label=new_label,
+                                    note=new_note,
+                                    lat=lat_v,
+                                    lon=lon_v,
+                                    score=score_v,
+                                )
+                                st.success(f"Saved label to {labels_path.name}.")
+                                st.rerun()
 
                             breakdown = score_breakdown_df(selected_row, run_params_data)
                             if breakdown is not None:
@@ -2189,6 +2673,14 @@ with tab_results:
                         )
                     else:
                         st.warning("candidates.csv not found")
+                    if labels_csv.exists():
+                        st.success("candidate_labels.csv")
+                        st.download_button(
+                            "Download candidate_labels.csv",
+                            data=labels_csv.read_bytes(),
+                            file_name=labels_csv.name,
+                            mime="text/csv",
+                        )
 
                 with cols[1]:
                     st.write("**GIS exports**")

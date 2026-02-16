@@ -59,11 +59,12 @@ import html
 import json
 import logging
 import math
+import time
 import re
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -145,6 +146,10 @@ class Params:
 
     # Candidate detection
     pos_relief_threshold_spec: str = "auto:p96"
+    consensus_enabled: bool = True
+    consensus_percentiles: Tuple[float, ...] = (95.0, 96.0, 97.0)
+    consensus_min_support: int = 2
+    consensus_match_radius_m: float = 12.0
     min_region_pixels: int = 20
     morph_open_iters: int = 1
     morph_close_iters: int = 1
@@ -158,6 +163,7 @@ class Params:
     # Post-filters (shape/physics)
     min_peak_relief_m: float = 0.50        # e.g. 0.4 to cut noise
     min_area_m2: float = 25.0              # e.g. 30
+    max_area_m2: float = 1200.0            # upper bound to suppress very large terrain blobs (<=0 disables)
     min_extent: float = 0.38               # bbox fill, 0..1 (e.g. 0.35)
     max_aspect: float = 3.5                # width/height or height/width (e.g. 4.0)
     edge_buffer_m: float = 10.0            # drop regions touching tile edge within this distance
@@ -182,10 +188,11 @@ class Params:
     cutout_dpi: int = 160
 
     # Score
-    # score = density^a * peak_relief^b * extent^c * prominence^d * compactness^e * solidity^f * area_m2^g
+    # score = density^a * peak_relief^b * extent^c * consensus_support^d * prominence^e * compactness^f * solidity^g * area_m2^h
     score_density_exp: float = 1.0
     score_peak_exp: float = 1.0
     score_extent_exp: float = 0.35
+    score_consensus_exp: float = 0.40
     score_prominence_exp: float = 0.75
     score_compactness_exp: float = 0.20
     score_solidity_exp: float = 0.20
@@ -288,6 +295,23 @@ def _arg_cluster_eps_spec(raw: str) -> str:
     if v <= 0:
         raise argparse.ArgumentTypeError("cluster-eps must be > 0 or 'auto'.")
     return f"{v:g}"
+
+
+def _arg_percentiles_csv(raw: str) -> str:
+    s = str(raw).strip()
+    if not s:
+        raise argparse.ArgumentTypeError("Percentile list must be non-empty (example: 95,96,97).")
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("Percentile list must contain comma-separated numbers.")
+    vals: List[float] = []
+    for p in parts:
+        v = _parse_float_arg(p, "consensus-percentiles")
+        if not (0.0 <= v <= 100.0):
+            raise argparse.ArgumentTypeError("Consensus percentiles must be between 0 and 100.")
+        vals.append(v)
+    uniq = sorted({round(v, 6) for v in vals})
+    return ",".join(f"{v:g}" for v in uniq)
 
 
 def sanitize_run_name(raw: str) -> str:
@@ -514,6 +538,7 @@ class Candidate:
     density: float
     extent: float              # bbox fill (0..1)
     aspect: float              # >=1
+    consensus_support: int     # number of threshold runs that support this region
     prominence_m: float        # mean relief over region minus local ring mean
     compactness: float         # 4*pi*A/P^2 in [0,1]
     solidity: float            # A / convex_hull_A in [0,1]
@@ -571,6 +596,76 @@ def detect_regions(
     """
     _, regions, _, pos_thresh = _extract_candidate_regions(lrm, dtm_slope_deg, profile, params)
     return regions, pos_thresh
+
+
+def _consensus_specs_from_params(params: Params) -> List[str]:
+    base_spec = str(params.pos_relief_threshold_spec).strip().lower()
+    if not params.consensus_enabled:
+        return [base_spec]
+
+    base_auto = _normalized_auto_percentile_spec(base_spec)
+    if base_auto is None:
+        return [base_spec]
+
+    vals: List[float] = []
+    for raw in params.consensus_percentiles:
+        try:
+            p = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= p <= 100.0:
+            vals.append(p)
+
+    if not vals:
+        vals = [95.0, 96.0, 97.0]
+
+    base_p = float(base_auto.split("auto:p", 1)[1])
+    vals.append(base_p)
+    uniq = sorted({round(v, 6) for v in vals})
+    return [f"auto:p{v:g}" for v in uniq]
+
+
+def _attach_region_density_stats(regions: List[Dict[str, Any]], labeled: np.ndarray, density_norm: np.ndarray) -> None:
+    for r in regions:
+        rid = int(r["rid"])
+        dens_vals = density_norm[labeled == rid]
+        dens_vals = dens_vals[np.isfinite(dens_vals)]
+        if dens_vals.size == 0:
+            r["density_mean"] = 0.0
+            r["density_q75"] = 0.0
+            continue
+        r["density_mean"] = float(np.mean(dens_vals))
+        r["density_q75"] = float(np.percentile(dens_vals, 75))
+
+
+def _compute_primary_consensus_support(
+    primary_regions: List[Dict[str, Any]],
+    region_sets: List[List[Dict[str, Any]]],
+    match_radius_pix: float,
+) -> None:
+    if not primary_regions:
+        return
+
+    r2 = float(max(0.0, match_radius_pix * match_radius_pix))
+    set_centers: List[np.ndarray] = []
+    for regs in region_sets:
+        if not regs:
+            set_centers.append(np.empty((0, 2), dtype="float64"))
+            continue
+        arr = np.array([[float(r["cx"]), float(r["cy"])] for r in regs], dtype="float64")
+        set_centers.append(arr)
+
+    for r in primary_regions:
+        cx = float(r["cx"])
+        cy = float(r["cy"])
+        support = 0
+        for centers in set_centers:
+            if centers.shape[0] == 0:
+                continue
+            d2 = (centers[:, 0] - cx) ** 2 + (centers[:, 1] - cy) ** 2
+            if float(np.min(d2)) <= r2:
+                support += 1
+        r["consensus_support"] = int(support)
 
 
 def _extract_candidate_regions(
@@ -703,32 +798,70 @@ def detect_candidates(
     profile: Dict[str, Any],
     params: Params,
     out_density_tif: Path,
-) -> Tuple[List[Dict[str, Any]], np.ndarray, float, float]:
+) -> Tuple[List[Dict[str, Any]], np.ndarray, float, float, Dict[str, Any]]:
     """
-    Convenience wrapper:
-    - creates labeled components & regions
-    - adds region-level density stats (mean/q75 over each region footprint)
-    - writes density raster from kept regions (size+slope kept)
-    - returns regions, density_norm, pos_thresh, min_density
+    Candidate extraction wrapper with optional multi-threshold consensus support.
+    Returns regions, density_norm, pos_thresh, min_density, diagnostics.
     """
-    labeled, regions, kept_rids, pos_thresh = _extract_candidate_regions(lrm, dtm_slope_deg, profile, params)
+    res_m = _res_m_from_profile(profile)
+    specs = _consensus_specs_from_params(params)
+
+    runs: List[Tuple[str, np.ndarray, List[Dict[str, Any]], List[int], float]] = []
+    for spec in specs:
+        p = replace(params, pos_relief_threshold_spec=spec)
+        labeled_i, regions_i, kept_rids_i, pos_thresh_i = _extract_candidate_regions(lrm, dtm_slope_deg, profile, p)
+        runs.append((spec, labeled_i, regions_i, kept_rids_i, pos_thresh_i))
+
+    primary_idx = 0
+    for i, (spec, _, _, _, _) in enumerate(runs):
+        if spec == str(params.pos_relief_threshold_spec).strip().lower():
+            primary_idx = i
+            break
+
+    primary_spec, labeled, regions, kept_rids, pos_thresh = runs[primary_idx]
+    diagnostics: Dict[str, Any] = {
+        "consensus_specs": [s for s, _, _, _, _ in runs],
+        "consensus_regions_before": int(len(regions)),
+        "consensus_dropped": 0,
+        "consensus_enabled": bool(params.consensus_enabled and len(runs) > 1),
+        "consensus_primary_spec": primary_spec,
+    }
+
+    if len(runs) > 1 and params.consensus_enabled and params.consensus_min_support > 1:
+        radius_pix = float(max(0.0, params.consensus_match_radius_m) / max(1e-9, res_m))
+        region_sets = [rset for _, _, rset, _, _ in runs]
+        _compute_primary_consensus_support(regions, region_sets, match_radius_pix=radius_pix)
+        before = len(regions)
+        regions = [r for r in regions if int(r.get("consensus_support", 0)) >= int(params.consensus_min_support)]
+        kept_rids = [int(r["rid"]) for r in regions]
+        dropped = max(0, before - len(regions))
+        diagnostics["consensus_dropped"] = int(dropped)
+        diagnostics["consensus_regions_after"] = int(len(regions))
+        diagnostics["consensus_radius_m"] = float(params.consensus_match_radius_m)
+        diagnostics["consensus_min_support"] = int(params.consensus_min_support)
+        LOG.info(
+            "Consensus support filter: specs=%s | min_support=%d | radius=%.1fm | dropped=%d | kept=%d",
+            ",".join(diagnostics["consensus_specs"]),
+            int(params.consensus_min_support),
+            float(params.consensus_match_radius_m),
+            int(dropped),
+            int(len(regions)),
+        )
+    else:
+        for r in regions:
+            r["consensus_support"] = 1
+        diagnostics["consensus_regions_after"] = int(len(regions))
+        if len(runs) <= 1:
+            LOG.info("Consensus support filter disabled (single threshold spec=%s).", primary_spec)
+        elif params.consensus_min_support <= 1:
+            LOG.info("Consensus support filter disabled (consensus_min_support <= 1).")
 
     density_norm = build_density_from_regions(labeled, kept_rids, profile, params, out_density_tif)
-
-    for r in regions:
-        rid = int(r["rid"])
-        dens_vals = density_norm[labeled == rid]
-        dens_vals = dens_vals[np.isfinite(dens_vals)]
-        if dens_vals.size == 0:
-            r["density_mean"] = 0.0
-            r["density_q75"] = 0.0
-            continue
-        r["density_mean"] = float(np.mean(dens_vals))
-        r["density_q75"] = float(np.percentile(dens_vals, 75))
+    _attach_region_density_stats(regions, labeled, density_norm)
 
     min_density = parse_auto_percentile(params.min_density_spec, density_norm, positive_only=False)
     LOG.info("Min density threshold: %.4f (spec=%s)", min_density, params.min_density_spec)
-    return regions, density_norm, pos_thresh, min_density
+    return regions, density_norm, pos_thresh, min_density, diagnostics
 
 
 # -----------------------------
@@ -908,6 +1041,7 @@ def write_geojson(candidates: List[Candidate], out_path: Path) -> None:
                     "area_m2": c.area_m2,
                     "extent": c.extent,
                     "aspect": c.aspect,
+                    "consensus_support": c.consensus_support,
                     "prominence_m": c.prominence_m,
                     "compactness": c.compactness,
                     "solidity": c.solidity,
@@ -935,6 +1069,7 @@ def write_csv(candidates: List[Candidate], out_path: Path) -> None:
                 "area_m2",
                 "extent",
                 "aspect",
+                "consensus_support",
                 "prominence_m",
                 "compactness",
                 "solidity",
@@ -957,6 +1092,7 @@ def write_csv(candidates: List[Candidate], out_path: Path) -> None:
                     f"{c.area_m2:.2f}",
                     f"{c.extent:.4f}",
                     f"{c.aspect:.3f}",
+                    c.consensus_support,
                     f"{c.prominence_m:.4f}",
                     f"{c.compactness:.4f}",
                     f"{c.solidity:.4f}",
@@ -1026,6 +1162,7 @@ def write_kml(candidates: List[Candidate], out_path: Path, label_top_n: int) -> 
             f"area_m2={c.area_m2:.0f}<br/>"
             f"extent={c.extent:.3f}<br/>"
             f"aspect={c.aspect:.2f}<br/>"
+            f"consensus_support={c.consensus_support}<br/>"
             f"prominence_m={c.prominence_m:.3f}<br/>"
             f"compactness={c.compactness:.3f}<br/>"
             f"solidity={c.solidity:.3f}<br/>"
@@ -1100,6 +1237,7 @@ def make_plots(out_dir: Path, lrm: np.ndarray, density: np.ndarray, candidates: 
 
     scores = np.array([c.score for c in candidates], dtype=float)
     peaks = np.array([c.peak_relief_m for c in candidates], dtype=float)
+    supports = np.array([c.consensus_support for c in candidates], dtype=float)
     prominence = np.array([c.prominence_m for c in candidates], dtype=float)
     areas = np.array([c.area_m2 for c in candidates], dtype=float)
     extents = np.array([c.extent for c in candidates], dtype=float)
@@ -1123,6 +1261,16 @@ def make_plots(out_dir: Path, lrm: np.ndarray, density: np.ndarray, candidates: 
     plt.xlabel("peak relief (m)")
     plt.ylabel("count")
     p = plots_dir / "peak_relief_hist.png"
+    plt.savefig(p, dpi=160, bbox_inches="tight")
+    plt.close()
+    LOG.info("Wrote plot: %s", p)
+
+    plt.figure(figsize=(10, 5))
+    plt.hist(supports, bins=max(5, int(np.max(supports)) + 1 if supports.size else 5))
+    plt.title("Consensus support distribution")
+    plt.xlabel("support count")
+    plt.ylabel("count")
+    p = plots_dir / "consensus_support_hist.png"
     plt.savefig(p, dpi=160, bbox_inches="tight")
     plt.close()
     LOG.info("Wrote plot: %s", p)
@@ -1228,17 +1376,23 @@ def write_report_md(
     md.append(f"- pos_relief_threshold: **{pos_thresh:.4f} m** (spec: `{params.pos_relief_threshold_spec}`)")
     md.append(f"- min_region_pixels: **{params.min_region_pixels}**")
     md.append(f"- max_slope_deg: **{params.max_slope_deg:.1f}**")
+    md.append(
+        f"- consensus: enabled={params.consensus_enabled}, percentiles={[float(p) for p in params.consensus_percentiles]}, "
+        f"min_support={params.consensus_min_support}, radius={params.consensus_match_radius_m:.1f}m"
+    )
     md.append(f"- density_sigma_pix: **{params.density_sigma_pix}**")
     md.append(f"- min_density: **{min_density:.4f}** (spec: `{params.min_density_spec}`)")
     md.append(
         f"- post-filters: min_peak={params.min_peak_relief_m:.2f}m, min_area={params.min_area_m2:.1f}m², "
+        f"max_area={params.max_area_m2:.1f}m², "
         f"min_extent={params.min_extent:.2f}, max_aspect={params.max_aspect:.2f}, edge_buffer={params.edge_buffer_m:.1f}m, "
         f"min_spacing={params.min_candidate_spacing_m:.1f}m, min_prominence={params.min_prominence_m:.2f}m, "
         f"min_compactness={params.min_compactness:.2f}, min_solidity={params.min_solidity:.2f}"
     )
     md.append(
         f"- score exponents: dens^{params.score_density_exp:.2f}, peak^{params.score_peak_exp:.2f}, "
-        f"extent^{params.score_extent_exp:.2f}, prominence^{params.score_prominence_exp:.2f}, compactness^{params.score_compactness_exp:.2f}, "
+        f"extent^{params.score_extent_exp:.2f}, consensus_support^{params.score_consensus_exp:.2f}, "
+        f"prominence^{params.score_prominence_exp:.2f}, compactness^{params.score_compactness_exp:.2f}, "
         f"solidity^{params.score_solidity_exp:.2f}, area^{params.score_area_exp:.2f}"
     )
     md.append(f"- cluster_eps_mode: **{params.cluster_eps_mode}** (base={params.cluster_eps_m:.1f} m), min_samples: **{params.cluster_min_samples}**")
@@ -1250,11 +1404,12 @@ def write_report_md(
     md.append("")
     md.append("## Top candidates")
     md.append("")
-    md.append("| rank | cand_id | score | dens | peak(m) | prominence(m) | area(m²) | extent | aspect | compactness | solidity | cluster | lon | lat |")
-    md.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    md.append("| rank | cand_id | score | dens | peak(m) | support | prominence(m) | area(m²) | extent | aspect | compactness | solidity | cluster | lon | lat |")
+    md.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for i, c in enumerate(top, start=1):
         md.append(
-            f"| {i} | {c.cand_id} | {c.score:.4f} | {c.density:.3f} | {c.peak_relief_m:.2f} | {c.prominence_m:.2f} | {c.area_m2:.0f} | "
+            f"| {i} | {c.cand_id} | {c.score:.4f} | {c.density:.3f} | {c.peak_relief_m:.2f} | {c.consensus_support} | "
+            f"{c.prominence_m:.2f} | {c.area_m2:.0f} | "
             f"{c.extent:.2f} | {c.aspect:.2f} | {c.compactness:.2f} | {c.solidity:.2f} | {c.cluster_id} | {c.lon:.6f} | {c.lat:.6f} |"
         )
     md.append("")
@@ -1264,6 +1419,7 @@ def write_report_md(
     md.append("- Local prominence = **region mean relief - surrounding ring mean relief**. Low values often indicate background trends.")
     md.append("- Edge buffer drops regions near tile boundaries to reduce edge artifacts.")
     md.append("- Spacing de-dup keeps highest-score candidate within each local spacing radius.")
+    md.append("- Consensus support counts how many threshold runs contain a nearby matching region.")
     md.append("- Compactness = **4πA/P²** (0..1). Lower values are more line-like and likely false positives.")
     md.append("- Solidity = **area / convex_hull_area** (0..1). Lower values are fragmented/irregular shapes.")
     md.append("- Slope filter uses **region slope q75** (not centroid slope).")
@@ -1331,10 +1487,12 @@ def write_run_params_json(
     clustering_crs: Optional[CRS],
     pdal_ver: str,
     dropped_edge: int,
+    dropped_consensus: int,
     dropped_density: int,
     dropped_post: int,
     dropped_spacing: int,
     candidate_count: int,
+    stage_metrics: Optional[Dict[str, float]] = None,
 ) -> Path:
     payload: Dict[str, Any] = {
         "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -1349,11 +1507,13 @@ def write_run_params_json(
         },
         "candidate_accounting": {
             "dropped_edge_buffer": int(dropped_edge),
+            "dropped_consensus_support": int(dropped_consensus),
             "dropped_density": int(dropped_density),
             "dropped_post_filters": int(dropped_post),
             "dropped_spacing_dedup": int(dropped_spacing),
             "kept_candidates": int(candidate_count),
         },
+        "stage_metrics_sec": stage_metrics or {},
         "params": asdict(params),
     }
     out_path = out_dir / "run_params.json"
@@ -1477,6 +1637,7 @@ def write_html_report(
                 "score": c.score,
                 "density": c.density,
                 "peak": c.peak_relief_m,
+                "support": c.consensus_support,
                 "prominence": c.prominence_m,
                 "area": c.area_m2,
                 "extent": c.extent,
@@ -1564,7 +1725,7 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
             img_tag = f"<img src='{html.escape(c.img_relpath)}' alt='candidate {c.cand_id} cutout'/>"
         doc += f"""
 <h3>Candidate {c.cand_id} <span class='badge'>rank {rank}</span> — score {c.score:.3f}</h3>
-<p><b>dens</b> {c.density:.3f} | <b>peak</b> {c.peak_relief_m:.2f} m | <b>prom</b> {c.prominence_m:.2f} m | <b>area</b> {c.area_m2:.0f} m² |
+<p><b>dens</b> {c.density:.3f} | <b>peak</b> {c.peak_relief_m:.2f} m | <b>support</b> {c.consensus_support} | <b>prom</b> {c.prominence_m:.2f} m | <b>area</b> {c.area_m2:.0f} m² |
 <b>extent</b> {c.extent:.2f} | <b>aspect</b> {c.aspect:.2f} | <b>compactness</b> {c.compactness:.2f} | <b>solidity</b> {c.solidity:.2f} | <b>cluster</b> {c.cluster_id}</p>
 <p><a href='{gmaps}' target='_blank'>{c.lat:.6f}, {c.lon:.6f}</a></p>
 {img_tag}
@@ -1578,7 +1739,7 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
 <table>
 <thead>
 <tr>
-<th>rank</th><th>cand_id</th><th>score</th><th>dens</th><th>peak(m)</th><th>prom(m)</th><th>area(m²)</th><th>extent</th><th>aspect</th><th>compact</th><th>solidity</th><th>cluster</th><th>lat</th><th>lon</th>
+<th>rank</th><th>cand_id</th><th>score</th><th>dens</th><th>peak(m)</th><th>support</th><th>prom(m)</th><th>area(m²)</th><th>extent</th><th>aspect</th><th>compact</th><th>solidity</th><th>cluster</th><th>lat</th><th>lon</th>
 </tr>
 </thead>
 <tbody>
@@ -1592,6 +1753,7 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
             f"<td>{c.score:.3f}</td>"
             f"<td>{c.density:.3f}</td>"
             f"<td>{c.peak_relief_m:.2f}</td>"
+            f"<td>{c.consensus_support}</td>"
             f"<td>{c.prominence_m:.2f}</td>"
             f"<td>{c.area_m2:.0f}</td>"
             f"<td>{c.extent:.2f}</td>"
@@ -1642,7 +1804,7 @@ points.forEach(p => {{
     <div style="font-size:14px">
       <b>Candidate ${{p.cand_id}}</b><br/>
       score <b>${{p.score.toFixed(3)}}</b> | dens ${{p.density.toFixed(3)}}<br/>
-      peak ${{p.peak.toFixed(2)}}m | prom ${{p.prominence.toFixed(2)}}m | area ${{Math.round(p.area)}} m²<br/>
+      peak ${{p.peak.toFixed(2)}}m | support ${{p.support}} | prom ${{p.prominence.toFixed(2)}}m | area ${{Math.round(p.area)}} m²<br/>
       extent ${{p.extent.toFixed(2)}} | aspect ${{p.aspect.toFixed(2)}}<br/>
       compactness ${{p.compactness.toFixed(2)}} | solidity ${{p.solidity.toFixed(2)}}<br/>
       cluster ${{p.cluster}}<br/>
@@ -1691,10 +1853,30 @@ def main() -> None:
     ap.add_argument("--min-density", type=_arg_min_density_spec, default=None, help="Override min density threshold (e.g. 0.10 or auto:p60)")
     ap.add_argument("--density-sigma", type=_arg_positive_float, default=None, help="Override density sigma (pixels)")
     ap.add_argument("--max-slope-deg", type=_arg_nonnegative_float, default=None, help="Max allowed region slope q75 in degrees (default 20)")
+    ap.add_argument("--no-consensus", action="store_true", help="Disable multi-threshold consensus support filtering")
+    ap.add_argument(
+        "--consensus-percentiles",
+        type=_arg_percentiles_csv,
+        default=None,
+        help="Comma-separated auto percentiles for consensus support (default 95,96,97)",
+    )
+    ap.add_argument(
+        "--consensus-min-support",
+        type=_arg_positive_int,
+        default=None,
+        help="Minimum threshold-support count required to keep a region (default 2)",
+    )
+    ap.add_argument(
+        "--consensus-radius-m",
+        type=_arg_nonnegative_float,
+        default=None,
+        help="Match radius (m) when counting support across thresholds (default 12)",
+    )
 
     # post-filters
     ap.add_argument("--min-peak", type=_arg_nonnegative_float, default=None, help="Min peak relief (m) post-filter (e.g. 0.5)")
     ap.add_argument("--min-area-m2", type=_arg_nonnegative_float, default=None, help="Min area (m^2) post-filter (e.g. 30)")
+    ap.add_argument("--max-area-m2", type=_arg_nonnegative_float, default=None, help="Max area (m^2) post-filter; <=0 disables")
     ap.add_argument("--min-extent", type=_arg_unit_interval, default=None, help="Min extent (0..1) post-filter (e.g. 0.35)")
     ap.add_argument("--max-aspect", type=_arg_ge_one_float, default=None, help="Max aspect ratio post-filter (e.g. 4.0)")
     ap.add_argument("--edge-buffer-m", type=_arg_nonnegative_float, default=None, help="Drop regions near tile edge within this distance (m, default 10)")
@@ -1706,6 +1888,7 @@ def main() -> None:
 
     # scoring knobs
     ap.add_argument("--score-extent-exp", type=_arg_nonnegative_float, default=None, help="Exponent for extent in score (default 0.35)")
+    ap.add_argument("--score-consensus-exp", type=_arg_nonnegative_float, default=None, help="Exponent for consensus support in score (default 0.40)")
     ap.add_argument("--score-prominence-exp", type=_arg_nonnegative_float, default=None, help="Exponent for prominence in score (default 0.75)")
     ap.add_argument("--score-compactness-exp", type=_arg_nonnegative_float, default=None, help="Exponent for compactness in score (default 0.20)")
     ap.add_argument("--score-solidity-exp", type=_arg_nonnegative_float, default=None, help="Exponent for solidity in score (default 0.20)")
@@ -1742,11 +1925,23 @@ def main() -> None:
         params.density_sigma_pix = args.density_sigma
     if args.max_slope_deg is not None:
         params.max_slope_deg = args.max_slope_deg
+    if args.no_consensus:
+        params.consensus_enabled = False
+    if args.consensus_percentiles is not None:
+        vals = tuple(float(x) for x in str(args.consensus_percentiles).split(",") if x)
+        if vals:
+            params.consensus_percentiles = vals
+    if args.consensus_min_support is not None:
+        params.consensus_min_support = int(args.consensus_min_support)
+    if args.consensus_radius_m is not None:
+        params.consensus_match_radius_m = float(args.consensus_radius_m)
 
     if args.min_peak is not None:
         params.min_peak_relief_m = args.min_peak
     if args.min_area_m2 is not None:
         params.min_area_m2 = args.min_area_m2
+    if args.max_area_m2 is not None:
+        params.max_area_m2 = args.max_area_m2
     if args.min_extent is not None:
         params.min_extent = args.min_extent
     if args.max_aspect is not None:
@@ -1766,6 +1961,8 @@ def main() -> None:
 
     if args.score_extent_exp is not None:
         params.score_extent_exp = args.score_extent_exp
+    if args.score_consensus_exp is not None:
+        params.score_consensus_exp = args.score_consensus_exp
     if args.score_prominence_exp is not None:
         params.score_prominence_exp = args.score_prominence_exp
     if args.score_compactness_exp is not None:
@@ -1812,6 +2009,8 @@ def main() -> None:
     setup_logging(out_dir)
     pdal_ver = pdal_version()
     LOG.info("PDAL detected: %s", pdal_ver)
+    run_t0 = time.perf_counter()
+    stage_metrics: Dict[str, float] = {}
 
     dtm_path = out_dir / "dtm.tif"
     lrm_path = out_dir / "lrm.tif"
@@ -1826,6 +2025,7 @@ def main() -> None:
     tmp_dir = out_dir / "_tmp"
 
     LOG.info("Step 0: Building DTM from LAZ/LAS")
+    step_t0 = time.perf_counter()
     build_dtm_from_laz(
         laz_path=input_path,
         out_dtm_tif=dtm_path,
@@ -1833,9 +2033,11 @@ def main() -> None:
         resolution_m=params.dtm_resolution_m,
         try_smrf=bool(args.try_smrf),
     )
+    stage_metrics["step0_dtm_sec"] = float(time.perf_counter() - step_t0)
     LOG.info("DTM written: %s", dtm_path)
 
     LOG.info("Step 1: Building multi-scale LRM")
+    step_t0 = time.perf_counter()
     dtm, dtm_prof = load_raster(dtm_path)
     dtm_transform = dtm_prof["transform"]
     res_m = _res_m_from_profile(dtm_prof)
@@ -1843,16 +2045,26 @@ def main() -> None:
     slope_deg = compute_slope_degrees(dtm, res_m=float(res_m))
     lrm = build_multiscale_lrm(dtm, params)
     write_float_geotiff(lrm_path, lrm, dtm_prof)
+    stage_metrics["step1_lrm_sec"] = float(time.perf_counter() - step_t0)
     LOG.info("LRM written: %s", lrm_path)
 
     LOG.info("Step 2: Detecting candidate structures")
-    regions, density_norm, pos_thresh, min_density = detect_candidates(
+    step_t0 = time.perf_counter()
+    LOG.info(
+        "Consensus config: enabled=%s | percentiles=%s | min_support=%d | radius=%.1fm",
+        str(params.consensus_enabled),
+        ",".join(f"{p:g}" for p in params.consensus_percentiles),
+        int(params.consensus_min_support),
+        float(params.consensus_match_radius_m),
+    )
+    regions, density_norm, pos_thresh, min_density, detect_diag = detect_candidates(
         lrm=lrm,
         dtm_slope_deg=slope_deg,
         profile=dtm_prof,
         params=params,
         out_density_tif=density_path,
     )
+    stage_metrics["step2_detect_sec"] = float(time.perf_counter() - step_t0)
 
     crs_any = dtm_prof.get("crs")
     if crs_any is None:
@@ -1866,6 +2078,7 @@ def main() -> None:
     dropped_post = 0
     dropped_edge = 0
     dropped_spacing = 0
+    dropped_consensus = int(detect_diag.get("consensus_dropped", 0))
     edge_buffer_pix = int(math.ceil(max(0.0, float(params.edge_buffer_m)) / max(1e-9, float(res_m))))
     H, W = density_norm.shape
 
@@ -1892,6 +2105,7 @@ def main() -> None:
         area_m2 = float(r["area_m2"])
         extent = float(r["extent"])
         aspect = float(r["aspect"])
+        consensus_support = int(max(1, int(r.get("consensus_support", 1))))
         prominence = float(r.get("prominence_m", 0.0))
         compactness = float(r.get("compactness", 0.0))
         solidity = float(r.get("solidity", 0.0))
@@ -1900,6 +2114,7 @@ def main() -> None:
         if (
             peak < params.min_peak_relief_m
             or area_m2 < params.min_area_m2
+            or (params.max_area_m2 > 0.0 and area_m2 > params.max_area_m2)
             or extent < params.min_extent
             or aspect > params.max_aspect
             or prominence < params.min_prominence_m
@@ -1913,6 +2128,7 @@ def main() -> None:
             (dens ** params.score_density_exp)
             * (max(1e-9, peak) ** params.score_peak_exp)
             * ((max(1e-6, extent)) ** params.score_extent_exp)
+            * ((max(1.0, float(consensus_support))) ** params.score_consensus_exp)
             * ((max(1e-6, prominence)) ** params.score_prominence_exp)
             * ((max(1e-6, compactness)) ** params.score_compactness_exp)
             * ((max(1e-6, solidity)) ** params.score_solidity_exp)
@@ -1933,6 +2149,7 @@ def main() -> None:
                 density=dens,
                 extent=extent,
                 aspect=aspect,
+                consensus_support=consensus_support,
                 prominence_m=prominence,
                 compactness=compactness,
                 solidity=solidity,
@@ -1956,12 +2173,14 @@ def main() -> None:
             c.cand_id = i
 
     LOG.info("Dropped by edge buffer (%.1f m): %d", params.edge_buffer_m, dropped_edge)
+    LOG.info("Dropped by consensus support: %d", dropped_consensus)
     LOG.info("Dropped by density (region mean < min_density): %d", dropped_density)
     LOG.info("Dropped by post-filters: %d", dropped_post)
     LOG.info("Dropped by spacing de-dup (%.1f m): %d", params.min_candidate_spacing_m, dropped_spacing)
     LOG.info("Kept candidates after density + post-filters: %d", len(candidates))
 
     LOG.info("Step 3: Clustering + settlement pattern analysis (meters)")
+    step_t0 = time.perf_counter()
     used_m_crs: Optional[CRS] = None
     if candidates:
         xs = []
@@ -1989,8 +2208,10 @@ def main() -> None:
 
         n_clusters = len({c.cluster_id for c in candidates if c.cluster_id != -1})
         LOG.info("Clusters found: %d (noise=%d)", n_clusters, sum(1 for c in candidates if c.cluster_id == -1))
+    stage_metrics["step3_cluster_sec"] = float(time.perf_counter() - step_t0)
 
     LOG.info("Step 4: Exporting GIS products")
+    step_t0 = time.perf_counter()
     write_geojson(candidates, geojson_path)
     LOG.info("Wrote GeoJSON: %s", geojson_path)
 
@@ -2002,11 +2223,15 @@ def main() -> None:
 
     write_clusters_csv(candidates, clusters_csv)
     LOG.info("Wrote clusters CSV: %s", clusters_csv)
+    stage_metrics["step4_export_sec"] = float(time.perf_counter() - step_t0)
 
     LOG.info("Step 5: Writing plots")
+    step_t0 = time.perf_counter()
     make_plots(out_dir, lrm, density_norm, candidates)
+    stage_metrics["step5_plots_sec"] = float(time.perf_counter() - step_t0)
 
     LOG.info("Step 6: Writing reports")
+    step_t0 = time.perf_counter()
     md_path = write_report_md(
         out_dir=out_dir,
         run_name=run_name,
@@ -2025,28 +2250,12 @@ def main() -> None:
     write_report_pdf(md_path, report_pdf)
     if report_pdf.exists():
         LOG.info("Wrote report.pdf: %s", report_pdf)
-
-    params_json = write_run_params_json(
-        out_dir=out_dir,
-        run_name=run_name,
-        input_path=input_path,
-        params=params,
-        pos_thresh=pos_thresh,
-        min_density=min_density,
-        src_crs=src_crs,
-        clustering_crs=used_m_crs,
-        pdal_ver=pdal_ver,
-        dropped_edge=dropped_edge,
-        dropped_density=dropped_density,
-        dropped_post=dropped_post,
-        dropped_spacing=dropped_spacing,
-        candidate_count=len(candidates),
-    )
-    LOG.info("Wrote run_params.json: %s", params_json)
+    stage_metrics["step6_reports_sec"] = float(time.perf_counter() - step_t0)
 
     if params.html_report and candidates:
         cutout_top_n = params.report_top_n if args.cutout_top_n is None else int(args.cutout_top_n)
         LOG.info("Step 7: Generating HTML report + cutouts")
+        step_t0 = time.perf_counter()
         generate_candidate_panels(
             out_dir=out_dir,
             run_name=run_name,
@@ -2067,6 +2276,28 @@ def main() -> None:
             min_density=min_density,
         )
         LOG.info("Wrote report.html: %s", html_out)
+        stage_metrics["step7_html_sec"] = float(time.perf_counter() - step_t0)
+
+    stage_metrics["total_runtime_sec"] = float(time.perf_counter() - run_t0)
+    params_json = write_run_params_json(
+        out_dir=out_dir,
+        run_name=run_name,
+        input_path=input_path,
+        params=params,
+        pos_thresh=pos_thresh,
+        min_density=min_density,
+        src_crs=src_crs,
+        clustering_crs=used_m_crs,
+        pdal_ver=pdal_ver,
+        dropped_edge=dropped_edge,
+        dropped_consensus=dropped_consensus,
+        dropped_density=dropped_density,
+        dropped_post=dropped_post,
+        dropped_spacing=dropped_spacing,
+        candidate_count=len(candidates),
+        stage_metrics=stage_metrics,
+    )
+    LOG.info("Wrote run_params.json: %s", params_json)
 
     update_manifest(runs_dir, run_name, out_dir, input_path)
 
@@ -2074,6 +2305,7 @@ def main() -> None:
     LOG.info("Quick open: %s", kml_path)
     if params.html_report:
         LOG.info("HTML report: %s", html_report_path)
+    LOG.info("Runtime summary (sec): %s", json.dumps(stage_metrics, sort_keys=True))
 
 
 if __name__ == "__main__":
