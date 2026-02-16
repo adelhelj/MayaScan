@@ -17,6 +17,209 @@ REPO_ROOT = Path(__file__).resolve().parent
 SCRIPT_PATH = REPO_ROOT / "maya_scan.py"
 LOGO_PATH = REPO_ROOT / "assets" / "mayascan_logo.svg"
 
+PRESET_BALANCED = "Balanced (Recommended)"
+PRESET_STRICT = "Strict (Low false positives)"
+PRESET_EXPLORATORY = "Exploratory (High recall)"
+
+PRESET_VALUES: dict[str, dict[str, object]] = {
+    PRESET_BALANCED: {
+        "cfg_pos_thresh": "auto:p96",
+        "cfg_min_density": "auto:p60",
+        "cfg_density_sigma": 40.0,
+        "cfg_max_slope_deg": 20.0,
+        "cfg_min_peak": 0.50,
+        "cfg_min_area_m2": 25.0,
+        "cfg_min_extent": 0.38,
+        "cfg_max_aspect": 3.5,
+        "cfg_min_compactness": 0.12,
+        "cfg_min_solidity": 0.50,
+        "cfg_cluster_eps": "auto",
+        "cfg_min_samples": 4,
+        "cfg_report_top_n": 30,
+        "cfg_label_top_n": 60,
+    },
+    PRESET_STRICT: {
+        "cfg_pos_thresh": "auto:p97",
+        "cfg_min_density": "auto:p65",
+        "cfg_density_sigma": 45.0,
+        "cfg_max_slope_deg": 18.0,
+        "cfg_min_peak": 0.60,
+        "cfg_min_area_m2": 35.0,
+        "cfg_min_extent": 0.42,
+        "cfg_max_aspect": 3.0,
+        "cfg_min_compactness": 0.16,
+        "cfg_min_solidity": 0.58,
+        "cfg_cluster_eps": "auto",
+        "cfg_min_samples": 5,
+        "cfg_report_top_n": 30,
+        "cfg_label_top_n": 60,
+    },
+    PRESET_EXPLORATORY: {
+        "cfg_pos_thresh": "auto:p95",
+        "cfg_min_density": "auto:p50",
+        "cfg_density_sigma": 35.0,
+        "cfg_max_slope_deg": 22.0,
+        "cfg_min_peak": 0.35,
+        "cfg_min_area_m2": 15.0,
+        "cfg_min_extent": 0.30,
+        "cfg_max_aspect": 4.5,
+        "cfg_min_compactness": 0.08,
+        "cfg_min_solidity": 0.40,
+        "cfg_cluster_eps": "auto",
+        "cfg_min_samples": 3,
+        "cfg_report_top_n": 30,
+        "cfg_label_top_n": 60,
+    },
+}
+
+
+def apply_preset_to_session(preset_name: str, *, update_selector: bool = True) -> None:
+    values = PRESET_VALUES.get(preset_name, PRESET_VALUES[PRESET_BALANCED])
+    for key, val in values.items():
+        st.session_state[key] = val
+    if update_selector:
+        st.session_state["cfg_preset"] = preset_name
+
+
+def preset_matches_session(preset_name: str) -> bool:
+    values = PRESET_VALUES.get(preset_name, PRESET_VALUES[PRESET_BALANCED])
+    for key, val in values.items():
+        cur = st.session_state.get(key)
+        if isinstance(val, float):
+            try:
+                if abs(float(cur) - val) > 1e-9:
+                    return False
+            except Exception:
+                return False
+        else:
+            if str(cur) != str(val):
+                return False
+    return True
+
+
+def current_ui_config_snapshot() -> dict[str, object]:
+    keys = [
+        "cfg_pos_thresh",
+        "cfg_min_density",
+        "cfg_density_sigma",
+        "cfg_max_slope_deg",
+        "cfg_min_peak",
+        "cfg_min_area_m2",
+        "cfg_min_extent",
+        "cfg_max_aspect",
+        "cfg_min_compactness",
+        "cfg_min_solidity",
+        "cfg_cluster_eps",
+        "cfg_min_samples",
+        "cfg_report_top_n",
+        "cfg_label_top_n",
+    ]
+    out: dict[str, object] = {}
+    for key in keys:
+        out[key] = st.session_state.get(key)
+    return out
+
+
+def preset_slug(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "_", name.lower())
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "preset"
+
+
+def read_run_summary(run_dir: Path) -> dict[str, object]:
+    out: dict[str, object] = {
+        "run_dir": str(run_dir),
+        "run_name": run_dir.name,
+        "candidates": None,
+        "clusters": None,
+        "noise": None,
+        "top_score": None,
+        "mean_score": None,
+        "median_score": None,
+    }
+
+    vals = parse_values_used(read_text_safely(run_dir / "process.log"))
+    if "candidates_kept" in vals:
+        out["candidates"] = vals.get("candidates_kept")
+    if "clusters_found" in vals:
+        out["clusters"] = vals.get("clusters_found")
+    if "clusters_noise" in vals:
+        out["noise"] = vals.get("clusters_noise")
+
+    csv_path = run_dir / "candidates.csv"
+    if csv_path.exists():
+        try:
+            df = pd.read_csv(csv_path)
+            if "score" in df.columns:
+                s = pd.to_numeric(df["score"], errors="coerce").dropna()
+                if not s.empty:
+                    out["top_score"] = float(s.max())
+                    out["mean_score"] = float(s.mean())
+                    out["median_score"] = float(s.median())
+            if out["candidates"] is None:
+                out["candidates"] = int(len(df))
+        except Exception:
+            pass
+    return out
+
+
+def write_preset_compare_artifacts(
+    runs_dir: Path,
+    base_name: str,
+    compare_payload: dict[str, object],
+) -> tuple[Path, Path]:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = f"{base_name}_preset_compare_{stamp}"
+    json_path = runs_dir / f"{stem}.json"
+    md_path = runs_dir / f"{stem}.md"
+
+    json_path.write_text(json.dumps(compare_payload, indent=2), encoding="utf-8")
+
+    runs = compare_payload.get("runs", [])
+    baseline = compare_payload.get("baseline_preset", "")
+    lines: list[str] = []
+    lines.append(f"# MayaScan Preset Comparison: {base_name}")
+    lines.append("")
+    lines.append(f"- Timestamp: **{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}**")
+    lines.append(f"- Baseline preset: **{baseline}**")
+    lines.append("")
+    lines.append("| preset | run_name | candidates | clusters | noise | top_score | mean_score | median_score | d_candidates | d_top_score |")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    if isinstance(runs, list):
+        for r in runs:
+            if not isinstance(r, dict):
+                continue
+            lines.append(
+                f"| {r.get('preset','')} | {r.get('run_name','')} | {r.get('candidates','')} | {r.get('clusters','')} | "
+                f"{r.get('noise','')} | {r.get('top_score','')} | {r.get('mean_score','')} | {r.get('median_score','')} | "
+                f"{r.get('d_candidates_vs_baseline','')} | {r.get('d_top_score_vs_baseline','')} |"
+            )
+    lines.append("")
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+    return json_path, md_path
+
+
+def resolve_input_path(mode: str, uploaded, input_local: str) -> Path | None:
+    if mode == "Upload .laz/.las":
+        if uploaded is None:
+            st.error("Please upload a .laz or .las file.")
+            return None
+        data_dir = REPO_ROOT / "data" / "lidar"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        uploaded_safe = sanitize_filename(uploaded.name)
+        upload_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        input_path = data_dir / f"{upload_stamp}_{uploaded_safe}"
+        input_path.write_bytes(uploaded.getvalue())
+        return input_path
+
+    input_path = Path(input_local).expanduser()
+    if not input_path.is_absolute():
+        input_path = (REPO_ROOT / input_path).resolve()
+    if not input_path.exists():
+        st.error(f"Input file not found: {input_path}")
+        return None
+    return input_path
+
 
 # -----------------------------
 # CLI command builder
@@ -30,10 +233,13 @@ def build_cmd(
     pos_thresh: str,
     min_density: str,
     density_sigma: float,
+    max_slope_deg: float,
     min_peak: float,
     min_area_m2: float,
     min_extent: float,
     max_aspect: float,
+    min_compactness: float,
+    min_solidity: float,
     cluster_eps: str,
     min_samples: int,
     report_top_n: int,
@@ -58,11 +264,15 @@ def build_cmd(
         cmd += ["--min-density", min_density.strip()]
     if density_sigma is not None:
         cmd += ["--density-sigma", str(density_sigma)]
+    if max_slope_deg is not None:
+        cmd += ["--max-slope-deg", str(max_slope_deg)]
 
     cmd += ["--min-peak", str(min_peak)]
     cmd += ["--min-area-m2", str(min_area_m2)]
     cmd += ["--min-extent", str(min_extent)]
     cmd += ["--max-aspect", str(max_aspect)]
+    cmd += ["--min-compactness", str(min_compactness)]
+    cmd += ["--min-solidity", str(min_solidity)]
 
     if cluster_eps.strip():
         cmd += ["--cluster-eps", cluster_eps.strip()]
@@ -375,11 +585,11 @@ def leaflet_map_html(df: pd.DataFrame) -> str:
     - Click a point to see key metrics
     """
     # Keep only what we need (prevents gigantic HTML)
-    cols = [c for c in ["cand_id", "score", "peak_relief_m", "area_m2", "extent", "aspect", "cluster_id", "lat", "lon"] if c in df.columns]
+    cols = [c for c in ["cand_id", "score", "peak_relief_m", "area_m2", "extent", "aspect", "compactness", "solidity", "cluster_id", "lat", "lon"] if c in df.columns]
     pts = df[cols].copy()
 
     # Ensure numeric for JS formatting
-    for c in ["score", "peak_relief_m", "area_m2", "extent", "aspect", "lat", "lon"]:
+    for c in ["score", "peak_relief_m", "area_m2", "extent", "aspect", "compactness", "solidity", "lat", "lon"]:
         if c in pts.columns:
             pts[c] = pd.to_numeric(pts[c], errors="coerce")
 
@@ -449,15 +659,17 @@ data.forEach(p => {{
     fillOpacity: 0.7
   }});
 
-  const popup = `
-    <b>Candidate ${"{p.cand_id}"}</b><br/>
-    Score: ${"{fmt(p.score, 3)}"}<br/>
-    Peak relief (m): ${"{fmt(p.peak_relief_m, 2)}"}<br/>
-    Area (m²): ${"{fmt(p.area_m2, 1)}"}<br/>
-    Compactness: ${"{fmt(p.extent, 3)}"}<br/>
-    Elongation: ${"{fmt(p.aspect, 2)}"}<br/>
-    Cluster: ${"{cid}"}
-  `;
+    const popup = `
+      <b>Candidate ${"{p.cand_id}"}</b><br/>
+      Score: ${"{fmt(p.score, 3)}"}<br/>
+      Peak relief (m): ${"{fmt(p.peak_relief_m, 2)}"}<br/>
+      Area (m²): ${"{fmt(p.area_m2, 1)}"}<br/>
+      Extent: ${"{fmt(p.extent, 3)}"}<br/>
+      Compactness: ${"{fmt(p.compactness, 3)}"}<br/>
+      Solidity: ${"{fmt(p.solidity, 3)}"}<br/>
+      Elongation: ${"{fmt(p.aspect, 2)}"}<br/>
+      Cluster: ${"{cid}"}
+    `;
 
   marker.bindPopup(popup);
   marker.addTo(map);
@@ -579,6 +791,21 @@ if "zip_path" not in st.session_state:
     st.session_state.zip_path = None
 if "is_running" not in st.session_state:
     st.session_state.is_running = False
+if "last_preset_selected" not in st.session_state:
+    st.session_state.last_preset_selected = None
+if "last_preset_match" not in st.session_state:
+    st.session_state.last_preset_match = None
+if "last_ui_config" not in st.session_state:
+    st.session_state.last_ui_config = None
+if "last_compare_summary" not in st.session_state:
+    st.session_state.last_compare_summary = None
+
+if "cfg_preset" not in st.session_state:
+    st.session_state.cfg_preset = PRESET_BALANCED
+if "cfg_pos_thresh" not in st.session_state:
+    apply_preset_to_session(st.session_state.cfg_preset)
+if "cfg_preset_prev" not in st.session_state:
+    st.session_state.cfg_preset_prev = st.session_state.cfg_preset
 
 
 # -----------------------------
@@ -620,6 +847,10 @@ with st.sidebar:
         st.session_state.last_run_dir = str(loaded_dir)
         st.session_state.last_cmd = None
         st.session_state.last_logs = ""
+        st.session_state.last_preset_selected = None
+        st.session_state.last_preset_match = None
+        st.session_state.last_ui_config = None
+        st.session_state.last_compare_summary = None
         st.session_state.zip_ready_for_run = None
         st.session_state.zip_path = None
         st.success(f"Loaded run: {selected_existing_run}")
@@ -637,10 +868,35 @@ with st.sidebar:
     )
 
     st.divider()
-    st.markdown("### 3) Detection (what becomes a candidate?)")
+    st.markdown("### 3) Scientific preset")
+    preset_name = st.selectbox(
+        "Parameter profile",
+        options=list(PRESET_VALUES.keys()),
+        key="cfg_preset",
+        help="Use presets for reproducible runs, then fine-tune any field below if needed.",
+    )
+    preset_changed = preset_name != st.session_state.get("cfg_preset_prev")
+    if preset_changed:
+        apply_preset_to_session(preset_name, update_selector=False)
+        st.session_state.cfg_preset_prev = preset_name
+        st.success(f"Applied preset automatically: {preset_name}")
+
+    apply_preset_clicked = st.button("Re-apply preset values", use_container_width=True)
+    if apply_preset_clicked:
+        apply_preset_to_session(preset_name, update_selector=False)
+        st.session_state.cfg_preset_prev = preset_name
+        st.success(f"Re-applied preset: {preset_name}")
+    preset_match = preset_matches_session(preset_name)
+    if preset_match:
+        st.caption("Current values match the selected preset.")
+    else:
+        st.caption("Current values are custom (modified from preset).")
+
+    st.divider()
+    st.markdown("### 4) Detection (what becomes a candidate?)")
     pos_thresh = st.text_input(
         "Relief threshold (auto percentile or meters)",
-        value="auto:p96",
+        key="cfg_pos_thresh",
         help=(
             "Controls how strong a terrain bump must be (in the Local Relief Model) to become a candidate.\n\n"
             "Examples:\n"
@@ -650,12 +906,12 @@ with st.sidebar:
     )
     min_density = st.text_input(
         "Neighborhood density threshold (auto percentile or 0–1)",
-        value="auto:p55",
+        key="cfg_min_density",
         help=(
             "After candidates are detected, MayaScan builds a smoothed “feature density” raster.\n"
             "This removes isolated noise and keeps candidates in locally feature-rich zones.\n\n"
             "Examples:\n"
-            "- `auto:p55` = keep candidates above the 55th percentile density\n"
+            "- `auto:p60` = keep candidates above the 60th percentile density\n"
             "- `0.12` = keep candidates where density ≥ 0.12"
         ),
     )
@@ -663,18 +919,29 @@ with st.sidebar:
         "Density smoothing scale (pixels)",
         min_value=1.0,
         max_value=500.0,
-        value=40.0,
+        key="cfg_density_sigma",
         step=1.0,
         help="Smoothing radius for density. Bigger = settlement-scale patterns; smaller = more local sensitivity.",
     )
+    max_slope_deg = st.number_input(
+        "Maximum region slope q75 (degrees)",
+        min_value=0.0,
+        max_value=89.0,
+        key="cfg_max_slope_deg",
+        step=0.5,
+        help=(
+            "Candidate regions are rejected if their 75th-percentile slope exceeds this value. "
+            "Lower values suppress steep-slope artifacts."
+        ),
+    )
 
     st.divider()
-    st.markdown("### 4) Shape cleanup (remove noise-like shapes)")
+    st.markdown("### 5) Shape cleanup (remove noise-like shapes)")
     min_peak = st.number_input(
         "Minimum peak relief (m)",
         min_value=0.0,
         max_value=5.0,
-        value=0.50,
+        key="cfg_min_peak",
         step=0.05,
         help="Drops candidates whose strongest relief peak is below this (often tiny terrain wiggles).",
     )
@@ -682,39 +949,73 @@ with st.sidebar:
         "Minimum footprint area (m²)",
         min_value=0.0,
         max_value=5000.0,
-        value=25.0,
+        key="cfg_min_area_m2",
         step=1.0,
         help="Drops very small candidate patches (area in square meters).",
     )
     min_extent = st.number_input(
-        "Minimum compactness (0–1)",
+        "Minimum extent (0–1)",
         min_value=0.0,
         max_value=1.0,
-        value=0.35,
+        key="cfg_min_extent",
         step=0.01,
-        help="Compactness = area / bounding-box-area. Higher = more coherent; lower often = thin/noisy ridges.",
+        help="Extent = area / bounding-box-area. Higher = more coherent; lower often = thin/noisy ridges.",
     )
     max_aspect = st.number_input(
         "Maximum elongation (≥1)",
         min_value=1.0,
         max_value=50.0,
-        value=4.0,
+        key="cfg_max_aspect",
         step=0.1,
         help="Elongation = max(width/height, height/width). High values are long/skinny shapes (often ridges/edges/artifacts).",
     )
+    min_compactness = st.number_input(
+        "Minimum compactness (0–1)",
+        min_value=0.0,
+        max_value=1.0,
+        key="cfg_min_compactness",
+        step=0.01,
+        help=(
+            "Compactness = 4*pi*Area / Perimeter^2. "
+            "Lower values are line-like features (often drainage/ridges)."
+        ),
+    )
+    min_solidity = st.number_input(
+        "Minimum solidity (0–1)",
+        min_value=0.0,
+        max_value=1.0,
+        key="cfg_min_solidity",
+        step=0.01,
+        help=(
+            "Solidity = Area / Convex Hull Area. "
+            "Lower values are fragmented or highly irregular features."
+        ),
+    )
 
     st.divider()
-    st.markdown("### 5) Clustering (settlement patterns)")
-    cluster_eps = st.text_input("Cluster radius (m)", value="auto", help="DBSCAN radius. Use `auto` or a number like `150`.")
-    min_samples = st.number_input("Min candidates per cluster", min_value=1, max_value=50, value=4, step=1)
+    st.markdown("### 6) Clustering (settlement patterns)")
+    cluster_eps = st.text_input("Cluster radius (m)", key="cfg_cluster_eps", help="DBSCAN radius. Use `auto` or a number like `150`.")
+    min_samples = st.number_input("Min candidates per cluster", min_value=1, max_value=50, key="cfg_min_samples", step=1)
 
     st.divider()
-    st.markdown("### 6) Outputs")
-    report_top_n = st.number_input("Featured candidates (Top N)", min_value=1, max_value=500, value=30, step=1)
-    label_top_n = st.number_input("KML labeled points (Top N)", min_value=0, max_value=5000, value=60, step=5)
+    st.markdown("### 7) Outputs")
+    report_top_n = st.number_input("Featured candidates (Top N)", min_value=1, max_value=500, key="cfg_report_top_n", step=1)
+    label_top_n = st.number_input("KML labeled points (Top N)", min_value=0, max_value=5000, key="cfg_label_top_n", step=5)
 
     st.divider()
     run_btn = st.button("▶ Run MayaScan", type="primary", disabled=st.session_state.is_running)
+    st.markdown("### 8) Compare presets")
+    compare_presets = st.multiselect(
+        "Presets to compare",
+        options=list(PRESET_VALUES.keys()),
+        default=[PRESET_BALANCED, PRESET_STRICT],
+        help="Runs each selected preset on the same input tile and summarizes differences.",
+    )
+    compare_btn = st.button(
+        "▶ Run preset comparison",
+        disabled=st.session_state.is_running or len(compare_presets) < 2,
+        help="Select at least two presets to enable comparison.",
+    )
     if st.session_state.is_running:
         st.caption("Run in progress...")
 
@@ -725,6 +1026,7 @@ with st.sidebar:
 tab_results, tab_runlogs, tab_glossary = st.tabs(["📍 Results", "⚙️ Run details", "📖 Glossary"])
 
 def resolve_input_and_run():
+    st.session_state.last_compare_summary = None
     runs_dir_path = resolve_runs_dir(runs_dir)
     runs_dir_path.mkdir(parents=True, exist_ok=True)
 
@@ -766,23 +1068,9 @@ def resolve_input_and_run():
     if cluster_eps_spec.lower() == "auto":
         cluster_eps_spec = "auto"
 
-    if mode == "Upload .laz/.las":
-        if uploaded is None:
-            st.error("Please upload a .laz or .las file.")
-            return None, None, None
-        data_dir = REPO_ROOT / "data" / "lidar"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        uploaded_safe = sanitize_filename(uploaded.name)
-        upload_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        input_path = data_dir / f"{upload_stamp}_{uploaded_safe}"
-        input_path.write_bytes(uploaded.getvalue())
-    else:
-        input_path = Path(input_local).expanduser()
-        if not input_path.is_absolute():
-            input_path = (REPO_ROOT / input_path).resolve()
-        if not input_path.exists():
-            st.error(f"Input file not found: {input_path}")
-            return None, None, None
+    input_path = resolve_input_path(mode, uploaded, input_local)
+    if input_path is None:
+        return None, None, None
 
     run_dir = runs_dir_path / safe_run_name
 
@@ -795,10 +1083,13 @@ def resolve_input_and_run():
         pos_thresh=pos_thresh_spec,
         min_density=min_density_spec,
         density_sigma=float(density_sigma),
+        max_slope_deg=float(max_slope_deg),
         min_peak=float(min_peak),
         min_area_m2=float(min_area_m2),
         min_extent=float(min_extent),
         max_aspect=float(max_aspect),
+        min_compactness=float(min_compactness),
+        min_solidity=float(min_solidity),
         cluster_eps=cluster_eps_spec,
         min_samples=int(min_samples),
         report_top_n=int(report_top_n),
@@ -808,6 +1099,10 @@ def resolve_input_and_run():
 
     st.session_state.last_run_dir = str(run_dir)
     st.session_state.last_cmd = cmd
+    st.session_state.last_preset_selected = preset_name
+    st.session_state.last_preset_match = bool(preset_match)
+    st.session_state.last_ui_config = current_ui_config_snapshot()
+    st.session_state.last_compare_summary = None
     st.session_state.zip_ready_for_run = None
     st.session_state.zip_path = None
 
@@ -866,10 +1161,178 @@ def resolve_input_and_run():
     return run_dir, runs_dir_path, cmd
 
 
+def resolve_and_run_preset_comparison():
+    st.session_state.last_compare_summary = None
+    runs_dir_path = resolve_runs_dir(runs_dir)
+    runs_dir_path.mkdir(parents=True, exist_ok=True)
+
+    safe_base_name = sanitize_run_name(run_name)
+    if len(compare_presets) < 2:
+        st.error("Select at least two presets for comparison.")
+        return None
+
+    input_path = resolve_input_path(mode, uploaded, input_local)
+    if input_path is None:
+        return None
+
+    compare_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_specs: list[dict[str, object]] = []
+    for p_name in compare_presets:
+        vals = PRESET_VALUES[p_name]
+        suffix = preset_slug(p_name)
+        run_name_i = sanitize_run_name(f"{safe_base_name}_{suffix}_{compare_stamp}")
+        run_dir_i = runs_dir_path / run_name_i
+
+        cmd_i = build_cmd(
+            input_path=input_path,
+            run_name=run_name_i,
+            runs_dir=runs_dir_path,
+            overwrite=overwrite,
+            try_smrf=try_smrf,
+            pos_thresh=str(vals["cfg_pos_thresh"]),
+            min_density=str(vals["cfg_min_density"]),
+            density_sigma=float(vals["cfg_density_sigma"]),
+            max_slope_deg=float(vals["cfg_max_slope_deg"]),
+            min_peak=float(vals["cfg_min_peak"]),
+            min_area_m2=float(vals["cfg_min_area_m2"]),
+            min_extent=float(vals["cfg_min_extent"]),
+            max_aspect=float(vals["cfg_max_aspect"]),
+            min_compactness=float(vals["cfg_min_compactness"]),
+            min_solidity=float(vals["cfg_min_solidity"]),
+            cluster_eps=str(vals["cfg_cluster_eps"]),
+            min_samples=int(vals["cfg_min_samples"]),
+            report_top_n=int(vals["cfg_report_top_n"]),
+            label_top_n=int(vals["cfg_label_top_n"]),
+            no_html=no_html,
+        )
+        run_specs.append(
+            {
+                "preset": p_name,
+                "run_name": run_name_i,
+                "run_dir": run_dir_i,
+                "cmd": cmd_i,
+            }
+        )
+
+    log_lines: list[str] = []
+    run_summaries: list[dict[str, object]] = []
+    n = len(run_specs)
+
+    with tab_runlogs:
+        st.markdown("### Preset comparison")
+        st.caption("Running selected presets on the same input tile.")
+
+        with st.expander("Commands", expanded=False):
+            for spec in run_specs:
+                st.code(" ".join(spec["cmd"]), language="bash")
+
+        status = st.empty()
+        progress_bar = st.progress(0.02)
+        with st.expander("Live logs", expanded=True):
+            log_box = st.empty()
+
+            for i, spec in enumerate(run_specs):
+                preset_i = str(spec["preset"])
+                cmd_i = spec["cmd"]
+                run_dir_i = Path(spec["run_dir"])
+                status.info(f"🏛️ Running {preset_i} ({i + 1}/{n})...")
+
+                proc = subprocess.Popen(
+                    cmd_i,
+                    cwd=str(REPO_ROOT),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+
+                while True:
+                    line = proc.stdout.readline() if proc.stdout else ""
+                    if line:
+                        msg = line.rstrip("\n")
+                        log_lines.append(f"[{preset_i}] {msg}")
+                        tail = "\n".join(log_lines[-450:])
+                        log_box.code(tail, language="text")
+                        step_info = parse_step_from_log_line(msg)
+                        if step_info:
+                            step_idx, step_title = step_info
+                            local_frac = max(0.02, min(0.98, float(step_idx + 1) / 8.0))
+                            global_frac = ((i + local_frac) / n)
+                            progress_bar.progress(max(0.02, min(0.99, global_frac)))
+                            status.info(f"🏛️ {preset_i}: Step {step_idx} - {step_title}")
+                    if line == "" and proc.poll() is not None:
+                        break
+                    time.sleep(0.01)
+
+                rc = proc.returncode
+                if rc != 0:
+                    st.session_state.last_logs = "\n".join(log_lines)
+                    st.session_state.last_cmd = cmd_i
+                    st.session_state.last_compare_summary = None
+                    status.error(f"Failed ❌  {preset_i} exited with code {rc}.")
+                    return None
+
+                s = read_run_summary(run_dir_i)
+                s["preset"] = preset_i
+                s["run_name"] = str(spec["run_name"])
+                run_summaries.append(s)
+                progress_bar.progress(max(0.02, min(0.99, float(i + 1) / n)))
+
+        progress_bar.progress(1.0)
+        status.success("Preset comparison complete ✅")
+
+    baseline = run_summaries[0] if run_summaries else {}
+    base_candidates = baseline.get("candidates")
+    base_top_score = baseline.get("top_score")
+    for s in run_summaries:
+        cand = s.get("candidates")
+        top = s.get("top_score")
+        try:
+            s["d_candidates_vs_baseline"] = int(cand) - int(base_candidates) if cand is not None and base_candidates is not None else None
+        except Exception:
+            s["d_candidates_vs_baseline"] = None
+        try:
+            s["d_top_score_vs_baseline"] = round(float(top) - float(base_top_score), 4) if top is not None and base_top_score is not None else None
+        except Exception:
+            s["d_top_score_vs_baseline"] = None
+
+    compare_payload: dict[str, object] = {
+        "timestamp_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "input_path": str(input_path),
+        "base_name": safe_base_name,
+        "baseline_preset": baseline.get("preset"),
+        "presets": [str(x) for x in compare_presets],
+        "runs": run_summaries,
+    }
+    json_path, md_path = write_preset_compare_artifacts(runs_dir_path, safe_base_name, compare_payload)
+    compare_payload["comparison_json"] = str(json_path)
+    compare_payload["comparison_md"] = str(md_path)
+
+    focus_preset = PRESET_BALANCED if PRESET_BALANCED in compare_presets else str(compare_presets[0])
+    focus_spec = next((s for s in run_specs if str(s["preset"]) == focus_preset), run_specs[0])
+    st.session_state.last_run_dir = str(focus_spec["run_dir"])
+    st.session_state.last_cmd = focus_spec["cmd"]
+    st.session_state.last_logs = "\n".join(log_lines)
+    st.session_state.last_preset_selected = focus_preset
+    st.session_state.last_preset_match = True
+    st.session_state.last_ui_config = dict(PRESET_VALUES.get(focus_preset, {}))
+    st.session_state.last_compare_summary = compare_payload
+    st.session_state.zip_ready_for_run = None
+    st.session_state.zip_path = None
+    return compare_payload
+
+
 if run_btn and not st.session_state.is_running:
     st.session_state.is_running = True
     try:
         resolve_input_and_run()
+    finally:
+        st.session_state.is_running = False
+
+if compare_btn and not st.session_state.is_running:
+    st.session_state.is_running = True
+    try:
+        resolve_and_run_preset_comparison()
     finally:
         st.session_state.is_running = False
 
@@ -879,6 +1342,59 @@ if run_btn and not st.session_state.is_running:
 # -----------------------------
 with tab_results:
     st.markdown("### Review")
+
+    compare_summary = st.session_state.get("last_compare_summary")
+    if compare_summary:
+        st.markdown("#### Preset comparison summary")
+        baseline = compare_summary.get("baseline_preset")
+        if baseline:
+            st.caption(f"Baseline preset: {baseline}")
+
+        rows = compare_summary.get("runs", [])
+        if isinstance(rows, list) and rows:
+            cmp_df = pd.DataFrame(rows)
+            show_cols = [
+                c for c in [
+                    "preset",
+                    "run_name",
+                    "candidates",
+                    "clusters",
+                    "noise",
+                    "top_score",
+                    "mean_score",
+                    "median_score",
+                    "d_candidates_vs_baseline",
+                    "d_top_score_vs_baseline",
+                ]
+                if c in cmp_df.columns
+            ]
+            if show_cols:
+                st.dataframe(cmp_df[show_cols], use_container_width=True)
+
+        cjson = compare_summary.get("comparison_json")
+        cmd = compare_summary.get("comparison_md")
+        d1, d2 = st.columns(2)
+        with d1:
+            if cjson:
+                p = Path(str(cjson))
+                if p.exists():
+                    st.download_button(
+                        "Download comparison JSON",
+                        data=p.read_bytes(),
+                        file_name=p.name,
+                        mime="application/json",
+                    )
+        with d2:
+            if cmd:
+                p = Path(str(cmd))
+                if p.exists():
+                    st.download_button(
+                        "Download comparison markdown",
+                        data=p.read_bytes(),
+                        file_name=p.name,
+                        mime="text/markdown",
+                    )
+        st.divider()
 
     if not st.session_state.last_run_dir:
         st.info("Run MayaScan from the sidebar to see results here.")
@@ -911,8 +1427,19 @@ with tab_results:
 
             with st.expander("Run settings used", expanded=False):
                 settings_data: dict[str, object] = {"run_dir": str(run_dir)}
+                settings_data["ui_preset_selected"] = st.session_state.get("last_preset_selected")
+                settings_data["ui_preset_match"] = st.session_state.get("last_preset_match")
                 if st.session_state.last_cmd:
                     settings_data["command"] = parse_cmd_settings(st.session_state.last_cmd)
+                if st.session_state.get("last_ui_config"):
+                    settings_data["ui_config_snapshot"] = st.session_state["last_ui_config"]
+
+                run_params_path = run_dir / "run_params.json"
+                if run_params_path.exists():
+                    try:
+                        settings_data["run_params_json"] = json.loads(run_params_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        settings_data["run_params_json"] = "Could not parse run_params.json"
 
                 if used:
                     settings_data["resolved_from_log"] = {
@@ -996,6 +1523,7 @@ with tab_results:
 
             report_html = run_dir / "report.html"
             report_md = run_dir / "report.md"
+            run_params_json = run_dir / "run_params.json"
             candidates_csv = run_dir / "candidates.csv"
             geojson = run_dir / "candidates.geojson"
             kml = run_dir / "candidates.kml"
@@ -1029,7 +1557,7 @@ with tab_results:
                     st.dataframe(
                         top[
                             [c for c in [
-                                "cand_id","score","density","peak_relief_m","area_m2","extent","aspect","cluster_id","lat","lon"
+                                "cand_id","score","density","peak_relief_m","area_m2","extent","aspect","compactness","solidity","cluster_id","lat","lon"
                             ] if c in top.columns]
                         ],
                         use_container_width=True,
@@ -1065,11 +1593,15 @@ with tab_results:
 
                             selected_row = top_view[top_view["_cand_id_int"] == int(selected_cid)].iloc[0]
                             st.markdown("#### Candidate detail")
-                            d1, d2, d3, d4 = st.columns(4)
+                            d1, d2, d3, d4, d5, d6 = st.columns(6)
                             d1.metric("Score", f"{float(selected_row['score']):.3f}" if "score" in selected_row else "—")
                             d2.metric("Peak relief (m)", f"{float(selected_row['peak_relief_m']):.2f}" if "peak_relief_m" in selected_row else "—")
                             d3.metric("Area (m²)", f"{float(selected_row['area_m2']):.1f}" if "area_m2" in selected_row else "—")
-                            d4.metric("Cluster", str(int(selected_row["cluster_id"])) if "cluster_id" in selected_row and pd.notna(selected_row["cluster_id"]) else "—")
+                            d4.metric("Extent", f"{float(selected_row['extent']):.3f}" if "extent" in selected_row else "—")
+                            d5.metric("Compactness", f"{float(selected_row['compactness']):.3f}" if "compactness" in selected_row else "—")
+                            d6.metric("Solidity", f"{float(selected_row['solidity']):.3f}" if "solidity" in selected_row else "—")
+                            if "cluster_id" in selected_row and pd.notna(selected_row["cluster_id"]):
+                                st.caption(f"Cluster: {int(selected_row['cluster_id'])}")
 
                             if "lat" in selected_row and "lon" in selected_row and pd.notna(selected_row["lat"]) and pd.notna(selected_row["lon"]):
                                 lat = float(selected_row["lat"])
@@ -1171,6 +1703,14 @@ with tab_results:
                             file_name=report_md.name,
                             mime="text/markdown",
                         )
+                    if run_params_json.exists():
+                        st.success("run_params.json")
+                        st.download_button(
+                            "Download run_params.json",
+                            data=run_params_json.read_bytes(),
+                            file_name=run_params_json.name,
+                            mime="application/json",
+                        )
 
                 st.divider()
                 st.markdown("#### Download everything")
@@ -1218,6 +1758,10 @@ with tab_results:
 # Run details tab (show last logs)
 # -----------------------------
 with tab_runlogs:
+    if st.session_state.get("last_compare_summary"):
+        st.markdown("### Last preset comparison")
+        st.json(st.session_state["last_compare_summary"])
+
     if st.session_state.last_cmd:
         st.markdown("### Last run")
         with st.expander("Command", expanded=False):
@@ -1249,14 +1793,22 @@ How strong a bump must be in the LRM to become a candidate region.
 `auto:p96` means “use the 96th percentile of positive relief values” for that tile.
 
 **Candidate region**  
-A connected patch of pixels above threshold (after cleanup and slope filtering).
+A connected patch of pixels above threshold (after cleanup and region-slope q75 filtering).
 
 **Neighborhood density**  
 A smoothed “how many candidates are nearby” signal. Helps emphasize settlement-like zones and suppress isolated noise.
 
-**Compactness (extent, 0–1)**  
+**Extent (bbox fill, 0–1)**  
 How filled-in a region is: area / bounding-box-area.  
 Higher = more coherent; lower often = thin/noisy ridges.
+
+**Compactness (0–1)**  
+Defined as `4*pi*Area / Perimeter^2`.  
+Lower values are more line-like and often correspond to drainage/ridge artifacts.
+
+**Solidity (0–1)**  
+Defined as `Area / ConvexHullArea`.  
+Lower values indicate fragmented/irregular shapes; higher values are more solid footprints.
 
 **Elongation (aspect ratio, ≥1)**  
 How stretched a region is.  
@@ -1264,5 +1816,11 @@ High values are long/skinny shapes (often ridges/edges/artifacts).
 
 **DBSCAN clustering**  
 Groups candidates into clusters based on distance in meters (useful for settlement patterns).
+
+**Scientific presets (Strict / Balanced / Exploratory)**  
+Reproducible parameter profiles to trade precision vs recall before manual tuning.
+
+**Preset comparison run**  
+Runs multiple presets on the same input tile and reports side-by-side metric deltas.
 """
     )

@@ -59,6 +59,7 @@ Using multi-scale relief analysis and spatial density modeling, MayaScan highlig
 - LAZ/LAS → DTM, LRM, and density surfaces
 - Automated candidate detection and scoring
 - Settlement clustering using DBSCAN
+- In-app preset comparison (Strict vs Balanced vs Exploratory)
 - Interactive HTML reports with cutouts and metrics
 - GIS-ready exports (CSV, GeoJSON, KML)
 - Streamlit interface for end-to-end review
@@ -104,6 +105,7 @@ MayaScan was built to:
 - GeoTIFFs (DTM, LRM, density)
 - CSV candidate table (`candidates.csv`)
 - GeoJSON / KML exports (`candidates.geojson`, `candidates.kml`)
+- Reproducibility metadata (`run_params.json`)
 - Plots and histograms (`plots/`)
 - Markdown + optional PDF summary (`report.md`, `report.pdf`)
 - Optional interactive HTML report with map + cutout panels (`report.html`, `html/img/`)
@@ -111,6 +113,8 @@ MayaScan was built to:
 ### Review UX (Streamlit App)
 
 A lightweight Streamlit UI wraps the CLI pipeline so you can upload a `.laz/.las` tile (or use a local path), tune thresholds with tooltips, run the pipeline with live logs, and review results in one place:
+- Preset profiles for reproducible runs (`Strict`, `Balanced`, `Exploratory`)
+- Side-by-side preset comparison summary (`.json` + `.md`) from inside the app
 - Interactive Leaflet map (Street + Satellite basemap toggle, no API keys)
 - Ranked candidates table
 - Candidate cutout panels (LRM + hillshade)
@@ -203,12 +207,15 @@ python maya_scan.py \
   --overwrite \
   --try-smrf \
   --pos-thresh auto:p96 \
-  --min-density auto:p55 \
+  --min-density auto:p60 \
   --density-sigma 40 \
+  --max-slope-deg 20 \
   --min-peak 0.50 \
   --min-area-m2 25 \
-  --min-extent 0.35 \
-  --max-aspect 4.0 \
+  --min-extent 0.38 \
+  --max-aspect 3.5 \
+  --min-compactness 0.12 \
+  --min-solidity 0.50 \
   --cluster-eps auto \
   --min-samples 4 \
   --report-top-n 30 \
@@ -266,7 +273,7 @@ For each region:
 ### 6. Scoring
 
 ```
-score = (density^a) × (peak^b) × (extent^c) × √area
+score = (density^a) × (peak^b) × (extent^c) × (compactness^d) × (solidity^e) × (area^f)
 ```
 
 Where `density` is the **region mean density** (not a single centroid pixel).
@@ -311,10 +318,10 @@ No API key is required.
 - `--pos-thresh auto:p96`  
   Relief threshold for candidate detection in the LRM. Higher percentile = fewer, stronger bumps.
 
-- `--min-density auto:p55` + `--density-sigma 40`  
+- `--min-density auto:p60` + `--density-sigma 40`  
   Builds a smoothed “feature density” raster, suppressing isolated noise and emphasizing settlement-like zones. Candidate gating/scoring use **region mean density**.
 
-- Internal region slope filter (default 25°)  
+- `--max-slope-deg 20` (default)  
   Uses the **75th percentile slope (q75)** over each region footprint to reject steep/noisy terrain artifacts.
 
 - Shape cleanup filters:
@@ -322,12 +329,14 @@ No API key is required.
   - `--min-area-m2` (m²): drop very small patches
   - `--min-extent` (0–1): keep coherent/filled regions (area / bbox_area)
   - `--max-aspect` (≥1): drop long skinny ridge-like artifacts
+  - `--min-compactness` (0–1): drop line-like regions (`4πA/P²`)
+  - `--min-solidity` (0–1): drop fragmented/irregular regions (`A / hull_area`)
 
 - `--cluster-eps auto` + `--min-samples 4`  
   DBSCAN clustering in **meters** (projected CRS units are converted to meters when needed; geographic CRS auto-projects to UTM). Useful for settlement pattern grouping.
 
-- `--score-extent-exp`  
-  Controls exponent `c` in `score = density^a × peak^b × extent^c × √area`. Higher values favor compact/high-extent regions. (CLI advanced option; Streamlit currently uses the default.)
+- Score exponents (`--score-extent-exp`, `--score-compactness-exp`, `--score-solidity-exp`, `--score-area-exp`)  
+  Control how strongly extent/compactness/solidity/area influence ranking.
 
 ---
 

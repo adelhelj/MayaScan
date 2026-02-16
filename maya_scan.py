@@ -33,12 +33,15 @@ python maya_scan.py \
   --overwrite \
   --try-smrf \
   --pos-thresh auto:p96 \
-  --min-density auto:p55 \
+  --min-density auto:p60 \
   --density-sigma 40 \
   --min-peak 0.50 \
   --min-area-m2 25 \
-  --min-extent 0.35 \
-  --max-aspect 4.0 \
+  --min-extent 0.38 \
+  --max-aspect 3.5 \
+  --max-slope-deg 20 \
+  --min-compactness 0.12 \
+  --min-solidity 0.50 \
   --cluster-eps auto \
   --min-samples 4 \
   --report-top-n 30 \
@@ -57,7 +60,7 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -65,7 +68,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import rasterio
 from rasterio.transform import xy as pix2map_xy
-from scipy.ndimage import binary_closing, binary_opening, gaussian_filter, label as cc_label
+from scipy.ndimage import binary_closing, binary_erosion, binary_opening, gaussian_filter, label as cc_label
+from scipy.spatial import ConvexHull, QhullError
 from pyproj import CRS, Transformer
 
 # Optional deps
@@ -137,27 +141,29 @@ class Params:
     lrm_sigmas_large: Tuple[float, ...] = (8.0, 12.0, 16.0)
 
     # Candidate detection
-    pos_relief_threshold_spec: str = "auto:p95"
+    pos_relief_threshold_spec: str = "auto:p96"
     min_region_pixels: int = 20
     morph_open_iters: int = 1
     morph_close_iters: int = 1
     # Region-level terrain filter: drop regions whose slope q75 exceeds this.
-    max_slope_deg: float = 25.0
+    max_slope_deg: float = 20.0
 
     # Density
-    density_sigma_pix: float = 35.0
-    min_density_spec: str = "auto:p50"
+    density_sigma_pix: float = 40.0
+    min_density_spec: str = "auto:p60"
 
     # Post-filters (shape/physics)
-    min_peak_relief_m: float = 0.0         # e.g. 0.4 to cut noise
-    min_area_m2: float = 0.0               # e.g. 30
-    min_extent: float = 0.0                # bbox fill, 0..1 (e.g. 0.35)
-    max_aspect: float = 9999.0             # width/height or height/width (e.g. 4.0)
+    min_peak_relief_m: float = 0.50        # e.g. 0.4 to cut noise
+    min_area_m2: float = 25.0              # e.g. 30
+    min_extent: float = 0.38               # bbox fill, 0..1 (e.g. 0.35)
+    max_aspect: float = 3.5                # width/height or height/width (e.g. 4.0)
+    min_compactness: float = 0.12          # 4*pi*A/P^2 in [0,1], lower = line-like
+    min_solidity: float = 0.50             # A / convex_hull_A in [0,1], lower = fragmented/linear
 
     # Clustering
     cluster_eps_m: float = 150.0
     cluster_eps_mode: str = "auto"  # "auto" or "fixed"
-    cluster_min_samples: int = 3
+    cluster_min_samples: int = 4
 
     # Outputs
     kml_label_top_n: int = 50
@@ -169,10 +175,13 @@ class Params:
     cutout_dpi: int = 160
 
     # Score
-    # score = (density^a) * (peak_relief^b) * (extent^c) * sqrt(area_m2)
+    # score = density^a * peak_relief^b * extent^c * compactness^d * solidity^e * area_m2^f
     score_density_exp: float = 1.0
     score_peak_exp: float = 1.0
     score_extent_exp: float = 0.35
+    score_compactness_exp: float = 0.20
+    score_solidity_exp: float = 0.20
+    score_area_exp: float = 0.50
 
 
 _RUN_NAME_BAD_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -497,6 +506,8 @@ class Candidate:
     density: float
     extent: float              # bbox fill (0..1)
     aspect: float              # >=1
+    compactness: float         # 4*pi*A/P^2 in [0,1]
+    solidity: float            # A / convex_hull_A in [0,1]
     width_m: float
     height_m: float
     score: float
@@ -505,6 +516,37 @@ class Candidate:
     cluster_id: int = -1
     dist_to_core_km: Optional[float] = None
     img_relpath: Optional[str] = None
+
+
+def _region_perimeter_pixels(region_mask: np.ndarray) -> float:
+    """
+    Approximate perimeter as boundary-pixel count after 1-pixel erosion.
+    Good enough for compactness filtering on raster regions.
+    """
+    if region_mask.size == 0:
+        return 0.0
+    eroded = binary_erosion(region_mask)
+    boundary = region_mask & ~eroded
+    return float(boundary.sum())
+
+
+def _region_solidity(xs: np.ndarray, ys: np.ndarray) -> float:
+    """
+    Solidity = area / convex_hull_area in raster pixel units.
+    Values near 1 are compact/filled; lower values are fragmented/linear.
+    """
+    n = int(xs.size)
+    if n < 3:
+        return 1.0
+    pts = np.column_stack([xs.astype("float64"), ys.astype("float64")])
+    try:
+        hull = ConvexHull(pts)
+        hull_area_pix2 = float(hull.volume)  # 2D hull area
+    except (QhullError, ValueError):
+        return 1.0
+    if hull_area_pix2 <= 1e-9:
+        return 1.0
+    return float(np.clip(float(n) / hull_area_pix2, 0.0, 1.0))
 
 
 def detect_regions(
@@ -583,6 +625,11 @@ def _extract_candidate_regions(
 
         extent = float(np.clip(area_m2 / bbox_area_m2, 0.0, 1.0))
         aspect = float(max(w_m / max(1e-9, h_m), h_m / max(1e-9, w_m)))  # >=1
+        perimeter_m = _region_perimeter_pixels(region) * res_m
+        compactness = float(
+            np.clip((4.0 * math.pi * area_m2) / max(1e-9, perimeter_m * perimeter_m), 0.0, 1.0)
+        )
+        solidity = _region_solidity(xs, ys)
 
         regions.append(
             {
@@ -597,6 +644,9 @@ def _extract_candidate_regions(
                 "aspect": aspect,
                 "width_m": w_m,
                 "height_m": h_m,
+                "perimeter_m": perimeter_m,
+                "compactness": compactness,
+                "solidity": solidity,
                 "slope_median_deg": slope_median_deg,
                 "slope_q75_deg": slope_q75_deg,
                 "slope_max_deg": slope_max_deg,
@@ -794,6 +844,8 @@ def write_geojson(candidates: List[Candidate], out_path: Path) -> None:
                     "area_m2": c.area_m2,
                     "extent": c.extent,
                     "aspect": c.aspect,
+                    "compactness": c.compactness,
+                    "solidity": c.solidity,
                     "width_m": c.width_m,
                     "height_m": c.height_m,
                     "cluster_id": c.cluster_id,
@@ -818,6 +870,8 @@ def write_csv(candidates: List[Candidate], out_path: Path) -> None:
                 "area_m2",
                 "extent",
                 "aspect",
+                "compactness",
+                "solidity",
                 "width_m",
                 "height_m",
                 "lon",
@@ -837,6 +891,8 @@ def write_csv(candidates: List[Candidate], out_path: Path) -> None:
                     f"{c.area_m2:.2f}",
                     f"{c.extent:.4f}",
                     f"{c.aspect:.3f}",
+                    f"{c.compactness:.4f}",
+                    f"{c.solidity:.4f}",
                     f"{c.width_m:.2f}",
                     f"{c.height_m:.2f}",
                     f"{c.lon:.8f}",
@@ -903,6 +959,8 @@ def write_kml(candidates: List[Candidate], out_path: Path, label_top_n: int) -> 
             f"area_m2={c.area_m2:.0f}<br/>"
             f"extent={c.extent:.3f}<br/>"
             f"aspect={c.aspect:.2f}<br/>"
+            f"compactness={c.compactness:.3f}<br/>"
+            f"solidity={c.solidity:.3f}<br/>"
             f"cluster_id={c.cluster_id}"
         )
         if c.dist_to_core_km is not None:
@@ -977,6 +1035,8 @@ def make_plots(out_dir: Path, lrm: np.ndarray, density: np.ndarray, candidates: 
     areas = np.array([c.area_m2 for c in candidates], dtype=float)
     extents = np.array([c.extent for c in candidates], dtype=float)
     aspects = np.array([c.aspect for c in candidates], dtype=float)
+    compactness = np.array([c.compactness for c in candidates], dtype=float)
+    solidity = np.array([c.solidity for c in candidates], dtype=float)
 
     plt.figure(figsize=(10, 5))
     plt.hist(scores[scores > 0], bins=30)
@@ -1028,6 +1088,26 @@ def make_plots(out_dir: Path, lrm: np.ndarray, density: np.ndarray, candidates: 
     plt.close()
     LOG.info("Wrote plot: %s", p)
 
+    plt.figure(figsize=(10, 5))
+    plt.hist(compactness, bins=30, range=(0, 1))
+    plt.title("Compactness distribution (4*pi*A/P^2)")
+    plt.xlabel("compactness (0..1)")
+    plt.ylabel("count")
+    p = plots_dir / "compactness_hist.png"
+    plt.savefig(p, dpi=160, bbox_inches="tight")
+    plt.close()
+    LOG.info("Wrote plot: %s", p)
+
+    plt.figure(figsize=(10, 5))
+    plt.hist(solidity, bins=30, range=(0, 1))
+    plt.title("Solidity distribution (area / convex_hull_area)")
+    plt.xlabel("solidity (0..1)")
+    plt.ylabel("count")
+    p = plots_dir / "solidity_hist.png"
+    plt.savefig(p, dpi=160, bbox_inches="tight")
+    plt.close()
+    LOG.info("Wrote plot: %s", p)
+
 
 def write_report_md(
     out_dir: Path,
@@ -1061,6 +1141,7 @@ def write_report_md(
     md.append(f"- Density raster: `{density_path}`")
     md.append(f"- Candidates: `candidates.csv`, `candidates.geojson`, `candidates.kml`")
     md.append(f"- Clusters: `{clusters_csv.name}`")
+    md.append("- Run metadata: `run_params.json`")
     md.append(f"- Plots: `plots/`")
     md.append(f"- HTML: `report.html` + `html/img/`")
     md.append("")
@@ -1070,9 +1151,16 @@ def write_report_md(
     md.append(f"- max_slope_deg: **{params.max_slope_deg:.1f}**")
     md.append(f"- density_sigma_pix: **{params.density_sigma_pix}**")
     md.append(f"- min_density: **{min_density:.4f}** (spec: `{params.min_density_spec}`)")
-    md.append(f"- post-filters: min_peak={params.min_peak_relief_m:.2f}m, min_area={params.min_area_m2:.1f}m², "
-              f"min_extent={params.min_extent:.2f}, max_aspect={params.max_aspect:.2f}")
-    md.append(f"- score exponents: dens^{params.score_density_exp:.2f}, peak^{params.score_peak_exp:.2f}, extent^{params.score_extent_exp:.2f}")
+    md.append(
+        f"- post-filters: min_peak={params.min_peak_relief_m:.2f}m, min_area={params.min_area_m2:.1f}m², "
+        f"min_extent={params.min_extent:.2f}, max_aspect={params.max_aspect:.2f}, "
+        f"min_compactness={params.min_compactness:.2f}, min_solidity={params.min_solidity:.2f}"
+    )
+    md.append(
+        f"- score exponents: dens^{params.score_density_exp:.2f}, peak^{params.score_peak_exp:.2f}, "
+        f"extent^{params.score_extent_exp:.2f}, compactness^{params.score_compactness_exp:.2f}, "
+        f"solidity^{params.score_solidity_exp:.2f}, area^{params.score_area_exp:.2f}"
+    )
     md.append(f"- cluster_eps_mode: **{params.cluster_eps_mode}** (base={params.cluster_eps_m:.1f} m), min_samples: **{params.cluster_min_samples}**")
     md.append(f"- KML labeled top-N: **{params.kml_label_top_n}**")
     md.append("")
@@ -1082,17 +1170,19 @@ def write_report_md(
     md.append("")
     md.append("## Top candidates")
     md.append("")
-    md.append("| rank | cand_id | score | dens | peak(m) | area(m²) | extent | aspect | cluster | lon | lat |")
-    md.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    md.append("| rank | cand_id | score | dens | peak(m) | area(m²) | extent | aspect | compactness | solidity | cluster | lon | lat |")
+    md.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for i, c in enumerate(top, start=1):
         md.append(
             f"| {i} | {c.cand_id} | {c.score:.4f} | {c.density:.3f} | {c.peak_relief_m:.2f} | {c.area_m2:.0f} | "
-            f"{c.extent:.2f} | {c.aspect:.2f} | {c.cluster_id} | {c.lon:.6f} | {c.lat:.6f} |"
+            f"{c.extent:.2f} | {c.aspect:.2f} | {c.compactness:.2f} | {c.solidity:.2f} | {c.cluster_id} | {c.lon:.6f} | {c.lat:.6f} |"
         )
     md.append("")
     md.append("## Notes")
     md.append("- Extent = **area / bbox_area** (0..1). Higher generally means more coherent/filled region.")
     md.append("- Aspect = max(width/height, height/width). Very large aspect often means linear/noisy ridges.")
+    md.append("- Compactness = **4πA/P²** (0..1). Lower values are more line-like and likely false positives.")
+    md.append("- Solidity = **area / convex_hull_area** (0..1). Lower values are fragmented/irregular shapes.")
     md.append("- Slope filter uses **region slope q75** (not centroid slope).")
     md.append("- Candidate density uses **region mean density** over each connected region.")
     md.append("- Clustering/distances are done in **meters** (auto-UTM if source CRS is geographic).")
@@ -1145,6 +1235,43 @@ def update_manifest(runs_dir: Path, run_name: str, out_dir: Path, input_path: Pa
         w.writerow(row)
 
     LOG.info("Updated manifest: %s", manifest)
+
+
+def write_run_params_json(
+    out_dir: Path,
+    run_name: str,
+    input_path: Path,
+    params: Params,
+    pos_thresh: float,
+    min_density: float,
+    src_crs: CRS,
+    clustering_crs: Optional[CRS],
+    pdal_ver: str,
+    dropped_density: int,
+    dropped_post: int,
+    candidate_count: int,
+) -> Path:
+    payload: Dict[str, Any] = {
+        "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "run_name": run_name,
+        "input_path": str(input_path),
+        "pdal_version": pdal_ver,
+        "source_crs": src_crs.to_string(),
+        "clustering_crs": None if clustering_crs is None else clustering_crs.to_string(),
+        "resolved_thresholds": {
+            "pos_relief_m": float(pos_thresh),
+            "min_density": float(min_density),
+        },
+        "candidate_accounting": {
+            "dropped_density": int(dropped_density),
+            "dropped_post_filters": int(dropped_post),
+            "kept_candidates": int(candidate_count),
+        },
+        "params": asdict(params),
+    }
+    out_path = out_dir / "run_params.json"
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out_path
 
 
 # -----------------------------
@@ -1266,6 +1393,8 @@ def write_html_report(
                 "area": c.area_m2,
                 "extent": c.extent,
                 "aspect": c.aspect,
+                "compactness": c.compactness,
+                "solidity": c.solidity,
                 "cluster": c.cluster_id,
                 "lat": c.lat,
                 "lon": c.lon,
@@ -1327,6 +1456,7 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
     <ul class='small'>
       <li><code>candidates.csv</code>, <code>candidates.geojson</code>, <code>candidates.kml</code></li>
       <li><code>dtm.tif</code>, <code>lrm.tif</code>, <code>mound_density.tif</code></li>
+      <li><code>run_params.json</code> (resolved settings + thresholds)</li>
       <li><code>plots/</code> (density, overlay, histograms)</li>
       <li><code>html/img/</code> (candidate cutouts)</li>
     </ul>
@@ -1347,7 +1477,7 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
         doc += f"""
 <h3>Candidate {c.cand_id} <span class='badge'>rank {rank}</span> — score {c.score:.3f}</h3>
 <p><b>dens</b> {c.density:.3f} | <b>peak</b> {c.peak_relief_m:.2f} m | <b>area</b> {c.area_m2:.0f} m² |
-<b>extent</b> {c.extent:.2f} | <b>aspect</b> {c.aspect:.2f} | <b>cluster</b> {c.cluster_id}</p>
+<b>extent</b> {c.extent:.2f} | <b>aspect</b> {c.aspect:.2f} | <b>compactness</b> {c.compactness:.2f} | <b>solidity</b> {c.solidity:.2f} | <b>cluster</b> {c.cluster_id}</p>
 <p><a href='{gmaps}' target='_blank'>{c.lat:.6f}, {c.lon:.6f}</a></p>
 {img_tag}
 <div class='hr'></div>
@@ -1360,7 +1490,7 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
 <table>
 <thead>
 <tr>
-<th>rank</th><th>cand_id</th><th>score</th><th>dens</th><th>peak(m)</th><th>area(m²)</th><th>extent</th><th>aspect</th><th>cluster</th><th>lat</th><th>lon</th>
+<th>rank</th><th>cand_id</th><th>score</th><th>dens</th><th>peak(m)</th><th>area(m²)</th><th>extent</th><th>aspect</th><th>compact</th><th>solidity</th><th>cluster</th><th>lat</th><th>lon</th>
 </tr>
 </thead>
 <tbody>
@@ -1377,6 +1507,8 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
             f"<td>{c.area_m2:.0f}</td>"
             f"<td>{c.extent:.2f}</td>"
             f"<td>{c.aspect:.2f}</td>"
+            f"<td>{c.compactness:.2f}</td>"
+            f"<td>{c.solidity:.2f}</td>"
             f"<td>{c.cluster_id}</td>"
             f"<td><a href='{gmaps}' target='_blank'>{c.lat:.6f}</a></td>"
             f"<td><a href='{gmaps}' target='_blank'>{c.lon:.6f}</a></td>"
@@ -1423,6 +1555,7 @@ points.forEach(p => {{
       score <b>${{p.score.toFixed(3)}}</b> | dens ${{p.density.toFixed(3)}}<br/>
       peak ${{p.peak.toFixed(2)}}m | area ${{Math.round(p.area)}} m²<br/>
       extent ${{p.extent.toFixed(2)}} | aspect ${{p.aspect.toFixed(2)}}<br/>
+      compactness ${{p.compactness.toFixed(2)}} | solidity ${{p.solidity.toFixed(2)}}<br/>
       cluster ${{p.cluster}}<br/>
       <a href="${{gmaps}}" target="_blank">Open in Google Maps</a>
       ${{imgHtml}}
@@ -1465,18 +1598,24 @@ def main() -> None:
     ap.add_argument("--try-smrf", action="store_true", help="Try PDAL SMRF ground classification before DTM")
 
     # knobs
-    ap.add_argument("--pos-thresh", type=_arg_pos_thresh_spec, default=None, help="Override pos relief threshold (e.g. 0.20 or auto:p95)")
-    ap.add_argument("--min-density", type=_arg_min_density_spec, default=None, help="Override min density threshold (e.g. 0.10 or auto:p50)")
+    ap.add_argument("--pos-thresh", type=_arg_pos_thresh_spec, default=None, help="Override pos relief threshold (e.g. 0.20 or auto:p96)")
+    ap.add_argument("--min-density", type=_arg_min_density_spec, default=None, help="Override min density threshold (e.g. 0.10 or auto:p60)")
     ap.add_argument("--density-sigma", type=_arg_positive_float, default=None, help="Override density sigma (pixels)")
+    ap.add_argument("--max-slope-deg", type=_arg_nonnegative_float, default=None, help="Max allowed region slope q75 in degrees (default 20)")
 
     # post-filters
     ap.add_argument("--min-peak", type=_arg_nonnegative_float, default=None, help="Min peak relief (m) post-filter (e.g. 0.5)")
     ap.add_argument("--min-area-m2", type=_arg_nonnegative_float, default=None, help="Min area (m^2) post-filter (e.g. 30)")
     ap.add_argument("--min-extent", type=_arg_unit_interval, default=None, help="Min extent (0..1) post-filter (e.g. 0.35)")
     ap.add_argument("--max-aspect", type=_arg_ge_one_float, default=None, help="Max aspect ratio post-filter (e.g. 4.0)")
+    ap.add_argument("--min-compactness", type=_arg_unit_interval, default=None, help="Min compactness 4*pi*A/P^2 (0..1), lower removes line-like shapes")
+    ap.add_argument("--min-solidity", type=_arg_unit_interval, default=None, help="Min solidity area/convex_hull_area (0..1), lower removes fragmented/linear shapes")
 
     # scoring knobs
     ap.add_argument("--score-extent-exp", type=_arg_nonnegative_float, default=None, help="Exponent for extent in score (default 0.35)")
+    ap.add_argument("--score-compactness-exp", type=_arg_nonnegative_float, default=None, help="Exponent for compactness in score (default 0.20)")
+    ap.add_argument("--score-solidity-exp", type=_arg_nonnegative_float, default=None, help="Exponent for solidity in score (default 0.20)")
+    ap.add_argument("--score-area-exp", type=_arg_nonnegative_float, default=None, help="Exponent for area_m2 in score (default 0.50)")
 
     # clustering knobs
     ap.add_argument("--cluster-eps", type=_arg_cluster_eps_spec, default=None, help="DBSCAN eps in meters or 'auto' (default auto)")
@@ -1507,6 +1646,8 @@ def main() -> None:
         params.min_density_spec = args.min_density
     if args.density_sigma is not None:
         params.density_sigma_pix = args.density_sigma
+    if args.max_slope_deg is not None:
+        params.max_slope_deg = args.max_slope_deg
 
     if args.min_peak is not None:
         params.min_peak_relief_m = args.min_peak
@@ -1516,9 +1657,19 @@ def main() -> None:
         params.min_extent = args.min_extent
     if args.max_aspect is not None:
         params.max_aspect = args.max_aspect
+    if args.min_compactness is not None:
+        params.min_compactness = args.min_compactness
+    if args.min_solidity is not None:
+        params.min_solidity = args.min_solidity
 
     if args.score_extent_exp is not None:
         params.score_extent_exp = args.score_extent_exp
+    if args.score_compactness_exp is not None:
+        params.score_compactness_exp = args.score_compactness_exp
+    if args.score_solidity_exp is not None:
+        params.score_solidity_exp = args.score_solidity_exp
+    if args.score_area_exp is not None:
+        params.score_area_exp = args.score_area_exp
 
     if args.cluster_eps is not None:
         if args.cluster_eps == "auto":
@@ -1555,7 +1706,8 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     setup_logging(out_dir)
-    LOG.info("PDAL detected: %s", pdal_version())
+    pdal_ver = pdal_version()
+    LOG.info("PDAL detected: %s", pdal_ver)
 
     dtm_path = out_dir / "dtm.tif"
     lrm_path = out_dir / "lrm.tif"
@@ -1623,9 +1775,18 @@ def main() -> None:
         area_m2 = float(r["area_m2"])
         extent = float(r["extent"])
         aspect = float(r["aspect"])
+        compactness = float(r.get("compactness", 0.0))
+        solidity = float(r.get("solidity", 0.0))
 
         # post-filters for “project goal”
-        if peak < params.min_peak_relief_m or area_m2 < params.min_area_m2 or extent < params.min_extent or aspect > params.max_aspect:
+        if (
+            peak < params.min_peak_relief_m
+            or area_m2 < params.min_area_m2
+            or extent < params.min_extent
+            or aspect > params.max_aspect
+            or compactness < params.min_compactness
+            or solidity < params.min_solidity
+        ):
             dropped_post += 1
             continue
 
@@ -1633,7 +1794,9 @@ def main() -> None:
             (dens ** params.score_density_exp)
             * (max(1e-9, peak) ** params.score_peak_exp)
             * ((max(1e-6, extent)) ** params.score_extent_exp)
-            * math.sqrt(max(1e-9, area_m2))
+            * ((max(1e-6, compactness)) ** params.score_compactness_exp)
+            * ((max(1e-6, solidity)) ** params.score_solidity_exp)
+            * (max(1e-9, area_m2) ** params.score_area_exp)
         )
 
         x_map, y_map = pix2map_xy(dtm_transform, r["cy"], r["cx"])
@@ -1650,6 +1813,8 @@ def main() -> None:
                 density=dens,
                 extent=extent,
                 aspect=aspect,
+                compactness=compactness,
+                solidity=solidity,
                 width_m=float(r["width_m"]),
                 height_m=float(r["height_m"]),
                 score=float(score),
@@ -1664,6 +1829,7 @@ def main() -> None:
     LOG.info("Kept candidates after density + post-filters: %d", len(candidates))
 
     LOG.info("Step 3: Clustering + settlement pattern analysis (meters)")
+    used_m_crs: Optional[CRS] = None
     if candidates:
         xs = []
         ys = []
@@ -1726,6 +1892,22 @@ def main() -> None:
     write_report_pdf(md_path, report_pdf)
     if report_pdf.exists():
         LOG.info("Wrote report.pdf: %s", report_pdf)
+
+    params_json = write_run_params_json(
+        out_dir=out_dir,
+        run_name=run_name,
+        input_path=input_path,
+        params=params,
+        pos_thresh=pos_thresh,
+        min_density=min_density,
+        src_crs=src_crs,
+        clustering_crs=used_m_crs,
+        pdal_ver=pdal_ver,
+        dropped_density=dropped_density,
+        dropped_post=dropped_post,
+        candidate_count=len(candidates),
+    )
+    LOG.info("Wrote run_params.json: %s", params_json)
 
     if params.html_report and candidates:
         cutout_top_n = params.report_top_n if args.cutout_top_n is None else int(args.cutout_top_n)
