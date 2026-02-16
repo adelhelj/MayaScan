@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 102 256 154" role="img" aria-labelledby="title desc">
+  <title id="title">MayaScan Logo</title>
+  <desc id="desc">Clean stepped Maya pyramid on low jungle hills.</desc>
+
+  <defs>
+    <linearGradient id="hill_back" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7c9570"/>
+      <stop offset="1" stop-color="#657c5d"/>
+    </linearGradient>
+    <linearGradient id="hill_front" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#607553"/>
+      <stop offset="1" stop-color="#4d6146"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Subtle hills -->
+  <path d="M0 208 C34 188, 72 186, 106 198 C136 208, 166 208, 200 198 C228 190, 246 192, 256 198 L256 256 L0 256 Z" fill="url(#hill_back)"/>
+  <path d="M0 224 C36 210, 74 210, 108 218 C140 226, 170 226, 204 218 C228 214, 246 214, 256 218 L256 256 L0 256 Z" fill="url(#hill_front)"/>
+
+  <!-- Pyramid: larger and seated into hills -->
+  <g fill="#b7864e" stroke="#8e673b" stroke-width="1">
+    <polygon points="44,216 212,216 191,196 65,196"/>
+    <polygon points="60,194 196,194 179,176 77,176"/>
+    <polygon points="74,174 182,174 168,158 88,158"/>
+    <polygon points="86,156 170,156 159,141 97,141"/>
+    <polygon points="97,139 159,139 150,126 106,126"/>
+    <rect x="110" y="108" width="36" height="16" rx="1.2"/>
+  </g>
+
+  <!-- Top faces -->
+  <g fill="#e5cfa7" opacity="0.95">
+    <polygon points="65,196 191,196 186,201 70,201"/>
+    <polygon points="77,176 179,176 175,181 81,181"/>
+    <polygon points="88,158 168,158 164,163 92,163"/>
+    <polygon points="97,141 159,141 156,145 100,145"/>
+    <polygon points="106,126 150,126 147,130 109,130"/>
+  </g>
+</svg>
