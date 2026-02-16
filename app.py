@@ -1322,8 +1322,8 @@ else:
 
 st.markdown(
     f"""
-<div style="display:flex; align-items:flex-start; gap:12px; margin:0.1rem 0 0.35rem 0;">
-  <div style="margin-top:-8px;">{header_icon_html}</div>
+<div style="display:flex; align-items:center; gap:12px; margin:0.1rem 0 0.35rem 0;">
+  <div>{header_icon_html}</div>
   <div>
     <div style="font-size:30px; font-weight:800; line-height:1.05;">MayaScan</div>
     <div style="color:#555; font-size:14px; margin-top:3px;">
