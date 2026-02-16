@@ -38,6 +38,7 @@ Thumbs.db
 # LiDAR data (large - not tracked)
 # ==============================
 data/lidar/*
+!data/lidar/
 !data/lidar/.gitkeep
 
 # ==============================
@@ -63,6 +64,10 @@ results/
 *.jpg
 *.log
 *.html
+
+# Keep repository media assets tracked
+!assets/
+!assets/**
 
 # ==============================
 # Jupyter (optional)

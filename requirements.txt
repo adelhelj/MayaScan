@@ -7,3 +7,4 @@ pyproj>=3.4
 matplotlib>=3.6
 reportlab>=3.6
 shapely>=2.0
+streamlit>=1.30
