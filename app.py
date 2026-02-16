@@ -15,6 +15,7 @@ import streamlit.components.v1 as components
 
 REPO_ROOT = Path(__file__).resolve().parent
 SCRIPT_PATH = REPO_ROOT / "maya_scan.py"
+LOGO_PATH = REPO_ROOT / "assets" / "mayascan_logo.svg"
 
 
 # -----------------------------
@@ -535,10 +536,22 @@ button[data-baseweb="tab"] { padding-top: 8px; padding-bottom: 8px; }
 )
 
 # Header
+if LOGO_PATH.exists():
+    try:
+        logo_b64 = base64.b64encode(LOGO_PATH.read_bytes()).decode("ascii")
+        header_icon_html = (
+            f"<img src='data:image/svg+xml;base64,{logo_b64}' "
+            "alt='MayaScan logo' style='width:78px; height:78px; display:block;'/>"
+        )
+    except Exception:
+        header_icon_html = "<div style='font-size:30px; line-height:1;'>🏛️</div>"
+else:
+    header_icon_html = "<div style='font-size:30px; line-height:1;'>🏛️</div>"
+
 st.markdown(
-    """
+    f"""
 <div style="display:flex; align-items:flex-start; gap:12px; margin:0.1rem 0 0.35rem 0;">
-  <div style="font-size:34px; line-height:1;">🗿</div>
+  <div style="margin-top:-8px;">{header_icon_html}</div>
   <div>
     <div style="font-size:30px; font-weight:800; line-height:1.05;">MayaScan</div>
     <div style="color:#555; font-size:14px; margin-top:3px;">
