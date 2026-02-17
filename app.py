@@ -146,6 +146,7 @@ def current_ui_config_snapshot() -> dict[str, object]:
         "cfg_min_samples",
         "cfg_report_top_n",
         "cfg_label_top_n",
+        "cfg_annotation_mode",
     ]
     out: dict[str, object] = {}
     for key in keys:
@@ -714,6 +715,31 @@ def assess_run_quality(used: dict, df: pd.DataFrame | None) -> dict[str, object]
     }
 
 
+def quality_action_hints(quality: dict[str, object], used: dict) -> list[str]:
+    hints: list[str] = []
+    cand_count = _to_int_or_none(quality.get("candidate_count"))
+    clusters = _to_int_or_none(quality.get("clusters"))
+    top_score = _to_float_or_none(quality.get("top_score"))
+    median_score = _to_float_or_none(quality.get("median_score"))
+    pos_spec = str(used.get("pos_thresh_spec") or "").strip()
+    dens_spec = str(used.get("min_density_spec") or "").strip()
+
+    if cand_count is not None and cand_count < 8:
+        hints.append("Candidate count is low. Try `Exploratory` preset or lower `min-density` and `min-prominence` slightly.")
+    if clusters is not None and clusters < 1:
+        hints.append("No clusters found. Try `--cluster-eps auto` (or increase fixed eps) and reduce `min-samples` to 3-4.")
+    if top_score is not None and top_score < 2.0:
+        hints.append("Top score is low. Relax shape strictness (`min_compactness`, `min_solidity`, `min_extent`) a bit.")
+    if median_score is not None and median_score < 0.35:
+        hints.append("Median score is low. Raise relief signal by lowering `pos-thresh` percentile (e.g., `auto:p95`).")
+    if pos_spec and pos_spec.startswith("auto:p") and pos_spec.lower() not in {"auto:p95", "auto:p94"}:
+        hints.append("For noisy/flat tiles, test `pos-thresh auto:p95` and compare outcomes in Preset Comparison.")
+    if dens_spec and dens_spec.startswith("auto:p") and dens_spec.lower() not in {"auto:p55", "auto:p50"}:
+        hints.append("If density gate is strict, try `min-density auto:p55` and inspect filter waterfall deltas.")
+
+    return hints[:4]
+
+
 def tuning_hints_from_filter_waterfall(
     dropped_edge: int | None,
     dropped_consensus: int | None,
@@ -1144,6 +1170,7 @@ def leaflet_map_html(df: pd.DataFrame) -> str:
     # Keep only what we need (prevents gigantic HTML)
     cols = [c for c in ["cand_id", "score", "peak_relief_m", "consensus_support", "prominence_m", "area_m2", "extent", "aspect", "compactness", "solidity", "cluster_id", "analyst_label", "lat", "lon"] if c in df.columns]
     pts = df[cols].copy()
+    has_analyst_label = "analyst_label" in pts.columns
 
     # Ensure numeric for JS formatting
     for c in ["score", "peak_relief_m", "consensus_support", "prominence_m", "area_m2", "extent", "aspect", "compactness", "solidity", "lat", "lon"]:
@@ -1228,7 +1255,7 @@ data.forEach(p => {{
       Solidity: ${"{fmt(p.solidity, 3)}"}<br/>
       Elongation: ${"{fmt(p.aspect, 2)}"}<br/>
       Cluster: ${"{cid}"}<br/>
-      Analyst label: ${"{p.analyst_label ?? 'unknown'}"}
+      {"Analyst label: ${p.analyst_label ?? 'unknown'}" if has_analyst_label else ""}
     `;
 
   marker.bindPopup(popup);
@@ -1288,11 +1315,11 @@ st.set_page_config(page_title="MayaScan", layout="wide")
 st.markdown(
     """
 <style>
-/* Make sure header never looks clipped */
-.block-container { padding-top: 4.5rem !important; padding-bottom: 2rem; }
+/* Make sure header never looks clipped across browser chrome/zoom variants */
+.block-container { padding-top: clamp(2.0rem, 3vh, 2.4rem) !important; padding-bottom: 2rem; }
 
 /* Sidebar spacing */
-section[data-testid="stSidebar"] .block-container { padding-top: 0.9rem; }
+section[data-testid="stSidebar"] .block-container { padding-top: 1.4rem !important; }
 
 /* Reduce widget gaps slightly */
 div[data-testid="stVerticalBlock"] > div { gap: 0.6rem; }
@@ -1322,10 +1349,10 @@ else:
 
 st.markdown(
     f"""
-<div style="display:flex; align-items:center; gap:12px; margin:0.1rem 0 0.35rem 0;">
+<div style="display:flex; align-items:center; gap:12px; margin:0.35rem 0 0.35rem 0;">
   <div>{header_icon_html}</div>
   <div>
-    <div style="font-size:30px; font-weight:800; line-height:1.05;">MayaScan</div>
+    <div style="font-size:30px; font-weight:800; line-height:1.15;">MayaScan</div>
     <div style="color:#555; font-size:14px; margin-top:3px;">
       Upload a LiDAR tile, run the pipeline, and review results (map + ranked candidates).
     </div>
@@ -1361,6 +1388,8 @@ if "last_compare_summary" not in st.session_state:
     st.session_state.last_compare_summary = None
 if "cfg_portfolio_mode" not in st.session_state:
     st.session_state.cfg_portfolio_mode = False
+if "cfg_annotation_mode" not in st.session_state:
+    st.session_state.cfg_annotation_mode = False
 if "cfg_run_name" not in st.session_state:
     st.session_state.cfg_run_name = next_default_run_name()
 if "pending_cfg_run_name" not in st.session_state:
@@ -1458,6 +1487,11 @@ with st.sidebar:
         key="cfg_portfolio_mode",
         help="Hides diagnostics-heavy sections and keeps presentation-focused outputs prominent.",
     )
+    annotation_mode = st.toggle(
+        "Annotation mode (manual labels)",
+        key="cfg_annotation_mode",
+        help="Shows analyst-label filters and candidate labeling UI. Keep off for a cleaner review-focused workflow.",
+    )
 
     st.divider()
     st.markdown("### 3) Scientific preset")
@@ -1473,7 +1507,7 @@ with st.sidebar:
         st.session_state.cfg_preset_prev = preset_name
         st.success(f"Applied preset automatically: {preset_name}")
 
-    apply_preset_clicked = st.button("Re-apply preset values", use_container_width=True)
+    apply_preset_clicked = st.button("Re-apply preset values", width="stretch")
     if apply_preset_clicked:
         apply_preset_to_session(preset_name, update_selector=False)
         st.session_state.cfg_preset_prev = preset_name
@@ -1671,7 +1705,19 @@ with st.sidebar:
     label_top_n = st.number_input("KML labeled points (Top N)", min_value=0, max_value=5000, key="cfg_label_top_n", step=5)
 
     st.divider()
-    run_btn = st.button("▶ Run MayaScan", type="primary", disabled=st.session_state.is_running)
+    input_ready = (uploaded is not None) if mode == "Upload .laz/.las" else bool(str(input_local).strip())
+    if not input_ready:
+        if mode == "Upload .laz/.las":
+            st.caption("Upload a `.laz/.las` file to enable run actions.")
+        else:
+            st.caption("Enter a local input path to enable run actions.")
+
+    run_btn = st.button(
+        "▶ Run MayaScan",
+        type="primary",
+        key="run_mayascan_btn",
+        disabled=st.session_state.is_running or not input_ready,
+    )
     st.markdown("### 8) Compare presets")
     compare_presets = st.multiselect(
         "Presets to compare",
@@ -1686,7 +1732,8 @@ with st.sidebar:
         st.caption("Select at least two presets to enable comparison.")
     compare_btn = st.button(
         "▶ Run preset comparison",
-        disabled=st.session_state.is_running or compare_count < 2,
+        key="run_preset_compare_btn",
+        disabled=st.session_state.is_running or compare_count < 2 or not input_ready,
         help="Select at least two presets to enable comparison.",
     )
     if st.session_state.is_running:
@@ -2072,14 +2119,14 @@ def resolve_and_run_preset_comparison(selected_compare_presets: list[str]):
     return compare_payload
 
 
-if run_btn and not st.session_state.is_running:
+if run_btn and not st.session_state.is_running and input_ready:
     st.session_state.is_running = True
     try:
         resolve_input_and_run()
     finally:
         st.session_state.is_running = False
 
-if compare_btn and not st.session_state.is_running:
+if compare_btn and not st.session_state.is_running and input_ready:
     st.session_state.is_running = True
     try:
         resolve_and_run_preset_comparison(compare_presets)
@@ -2119,12 +2166,12 @@ with tab_results:
                 level="warning",
             )
         else:
-            # Wait briefly for pipeline outputs to fully land
             wait_for_file(run_dir / "candidates.csv", timeout_s=6.0)
             wait_for_file(run_dir / "process.log", timeout_s=6.0)
 
             process_log = read_text_safely(run_dir / "process.log")
             used = parse_values_used(process_log)
+
             run_params_path = run_dir / "run_params.json"
             run_params_data: dict | None = None
             if run_params_path.exists():
@@ -2135,11 +2182,14 @@ with tab_results:
                 except Exception:
                     run_params_data = None
 
-            labels_df = load_candidate_labels(run_dir)
             df_loaded = load_candidates(run_dir)
-            df = merge_labels_into_candidates(df_loaded, labels_df) if df_loaded is not None else None
+            if df_loaded is not None and annotation_mode:
+                labels_df = load_candidate_labels(run_dir)
+                df = merge_labels_into_candidates(df_loaded, labels_df)
+            else:
+                df = df_loaded
             quality = assess_run_quality(used, df)
-            label_metrics = candidate_label_metrics(df if df is not None else pd.DataFrame())
+
             st.markdown(
                 (
                     "<div style='display:inline-block; padding:6px 12px; border-radius:999px; "
@@ -2148,42 +2198,13 @@ with tab_results:
                 ),
                 unsafe_allow_html=True,
             )
-            with st.expander("Quality rationale", expanded=False):
-                for label, ok in quality["checks"]:
-                    st.write(f"{'✅' if ok else '⚠️'} {label}")
-                st.caption("This is a triage heuristic for review confidence, not archaeological validation.")
 
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Candidates", used.get("candidates_kept", "—"))
-            c2.metric("Relief threshold used (m)", used.get("pos_thresh_m", "—"))
-            c3.metric("Density threshold used", used.get("min_density", "—"))
-            c4.metric("Cluster radius used (m)", used.get("dbscan_eps_m", "—"))
-            c5.metric("Clusters", used.get("clusters_found", "—"))
-
-            if label_metrics:
-                l1, l2, l3, l4, l5 = st.columns(5)
-                l1.metric("Likely labels", int(label_metrics.get("likely_count", 0)))
-                l2.metric("Unlikely labels", int(label_metrics.get("unlikely_count", 0)))
-                l3.metric("Unknown labels", int(label_metrics.get("unknown_count", 0)))
-                if "analyst_precision" in label_metrics:
-                    l4.metric("Analyst precision", f"{100.0 * float(label_metrics['analyst_precision']):.1f}%")
-                else:
-                    l4.metric("Analyst precision", "—")
-                if "analyst_false_positive_rate" in label_metrics:
-                    l5.metric("Analyst FPR", f"{100.0 * float(label_metrics['analyst_false_positive_rate']):.1f}%")
-                else:
-                    l5.metric("Analyst FPR", "—")
-                with st.expander("Label-guided score metrics", expanded=False):
-                    rows = []
-                    for k in ("p_at_5", "p_at_10", "p_at_20", "coverage_at_5", "coverage_at_10", "coverage_at_20"):
-                        if k in label_metrics:
-                            rows.append({"metric": k, "value": float(label_metrics[k])})
-                    if rows:
-                        md = pd.DataFrame(rows)
-                        md["value"] = md["value"].map(lambda v: f"{100.0 * float(v):.1f}%")
-                        st.dataframe(md, use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("Add labels on candidates to unlock precision@K estimates.")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Candidates", used.get("candidates_kept", "—"))
+            m2.metric("Relief threshold (m)", used.get("pos_thresh_m", "—"))
+            m3.metric("Density threshold", used.get("min_density", "—"))
+            m4.metric("Cluster radius (m)", used.get("dbscan_eps_m", "—"))
+            m5.metric("Clusters", used.get("clusters_found", "—"))
 
             if used:
                 st.caption(
@@ -2192,125 +2213,19 @@ with tab_results:
                     f"density={used.get('min_density','—')} ({used.get('min_density_spec','—')}), "
                     f"cluster_eps={used.get('dbscan_eps_m','—')} m."
                 )
-
-            acct = {}
-            if isinstance(run_params_data, dict):
-                acct_raw = run_params_data.get("candidate_accounting")
-                if isinstance(acct_raw, dict):
-                    acct = acct_raw
-            dropped_edge = _to_int_or_none(acct.get("dropped_edge_buffer", used.get("dropped_edge")))
-            dropped_consensus = _to_int_or_none(acct.get("dropped_consensus_support", used.get("dropped_consensus")))
-            dropped_density = _to_int_or_none(acct.get("dropped_density", used.get("dropped_density")))
-            dropped_post = _to_int_or_none(acct.get("dropped_post_filters", used.get("dropped_post")))
-            dropped_spacing = _to_int_or_none(acct.get("dropped_spacing_dedup", used.get("dropped_spacing")))
-            kept = _to_int_or_none(acct.get("kept_candidates", used.get("candidates_kept")))
-
-            if any(v is not None for v in [dropped_edge, dropped_consensus, dropped_density, dropped_post, dropped_spacing, kept]):
-                st.markdown("#### Filter waterfall")
-                rows = [
-                    {"stage": "Dropped edge", "count": int(dropped_edge or 0)},
-                    {"stage": "Dropped consensus", "count": int(dropped_consensus or 0)},
-                    {"stage": "Dropped density", "count": int(dropped_density or 0)},
-                    {"stage": "Dropped post-filters", "count": int(dropped_post or 0)},
-                    {"stage": "Dropped spacing dedup", "count": int(dropped_spacing or 0)},
-                    {"stage": "Kept candidates", "count": int(kept or 0)},
-                ]
-                wf_df = pd.DataFrame(rows)
-                st.bar_chart(wf_df.set_index("stage"), use_container_width=True)
-                st.caption("Use this to diagnose whether strictness is coming from edge/density/shape/spacing filters.")
-                tuning_hints = tuning_hints_from_filter_waterfall(
-                    dropped_edge=dropped_edge,
-                    dropped_consensus=dropped_consensus,
-                    dropped_density=dropped_density,
-                    dropped_post=dropped_post,
-                    dropped_spacing=dropped_spacing,
-                    kept=kept,
-                )
-                if tuning_hints:
-                    render_hint_block("Tuning suggestions from this run", tuning_hints, level="info")
-
-            stage_metrics_raw = {}
-            if isinstance(run_params_data, dict):
-                sm = run_params_data.get("stage_metrics_sec")
-                if isinstance(sm, dict):
-                    stage_metrics_raw = sm
-            if stage_metrics_raw:
-                stage_rows: list[dict[str, object]] = []
-                for k, v in stage_metrics_raw.items():
-                    try:
-                        fv = float(v)
-                    except Exception:
-                        continue
-                    stage_rows.append({"stage": str(k), "seconds": fv})
-                if stage_rows:
-                    stage_df = pd.DataFrame(stage_rows).sort_values("seconds", ascending=False)
-                    st.markdown("#### Runtime profile")
-                    st.bar_chart(stage_df.set_index("stage")[["seconds"]], use_container_width=True)
-                    total_rt = next((r["seconds"] for r in stage_rows if str(r["stage"]) == "total_runtime_sec"), None)
-                    if isinstance(total_rt, float):
-                        st.caption(f"Total runtime: {total_rt:.2f} sec")
-
-            if not portfolio_mode:
-                with st.expander("Run settings used", expanded=False):
-                    settings_data: dict[str, object] = {"run_dir": str(run_dir)}
-                    settings_data["ui_preset_selected"] = st.session_state.get("last_preset_selected")
-                    settings_data["ui_preset_match"] = st.session_state.get("last_preset_match")
-                    if st.session_state.last_cmd:
-                        settings_data["command"] = parse_cmd_settings(st.session_state.last_cmd)
-                    if st.session_state.get("last_ui_config"):
-                        settings_data["ui_config_snapshot"] = st.session_state["last_ui_config"]
-
-                    if run_params_data is not None:
-                        settings_data["run_params_json"] = run_params_data
-
-                    if used:
-                        settings_data["resolved_from_log"] = {
-                            "relief_threshold_m": used.get("pos_thresh_m"),
-                            "relief_threshold_spec": used.get("pos_thresh_spec"),
-                            "min_density": used.get("min_density"),
-                            "min_density_spec": used.get("min_density_spec"),
-                            "dbscan_eps_m": used.get("dbscan_eps_m"),
-                            "dbscan_min_samples": used.get("dbscan_min_samples"),
-                            "candidates_kept": used.get("candidates_kept"),
-                            "clusters_found": used.get("clusters_found"),
-                            "clusters_noise": used.get("clusters_noise"),
-                            "dropped_edge": used.get("dropped_edge"),
-                            "dropped_consensus": used.get("dropped_consensus"),
-                            "dropped_density": used.get("dropped_density"),
-                            "dropped_post": used.get("dropped_post"),
-                            "dropped_spacing": used.get("dropped_spacing"),
-                        }
-
-                    report_md_path = run_dir / "report.md"
-                    if report_md_path.exists():
-                        m = re.search(r"- Input:\s*`([^`]+)`", read_text_safely(report_md_path))
-                        if m:
-                            settings_data["input"] = m.group(1)
-
-                    st.json(settings_data)
-
-            with st.expander("Provenance (copy / paste)", expanded=False):
-                prov_text = build_provenance_text(
-                    run_dir=run_dir,
-                    command=st.session_state.last_cmd,
-                    used=used,
-                    run_params_data=run_params_data,
-                    preset_name=st.session_state.get("last_preset_selected"),
-                    preset_match=st.session_state.get("last_preset_match"),
-                )
-                st.text_area("Provenance block", value=prov_text, height=220, key=f"prov_{run_dir.name}")
-                st.download_button(
-                    "Download provenance.txt",
-                    data=prov_text.encode("utf-8"),
-                    file_name=f"{run_dir.name}_provenance.txt",
-                    mime="text/plain",
-                )
-
-            st.divider()
+            if str(quality.get("label", "")).lower().startswith("weak"):
+                next_steps = quality_action_hints(quality, used)
+                if next_steps:
+                    render_hint_block("Quick tuning steps for this weak/noisy run", next_steps, level="warning")
 
             filtered_df = df
             if df is not None and not df.empty:
-                filter_col1, filter_col2, filter_col3 = st.columns(3)
+                st.markdown("#### Review filters")
+                if annotation_mode:
+                    filter_col1, filter_col2, filter_col3 = st.columns(3)
+                else:
+                    filter_col1, filter_col2 = st.columns(2)
+                    filter_col3 = None
 
                 min_score_filter: float | None = None
                 with filter_col1:
@@ -2340,30 +2255,34 @@ with tab_results:
                 with filter_col2:
                     if "cluster_id" in df.columns:
                         cluster_ids = sorted(pd.to_numeric(df["cluster_id"], errors="coerce").dropna().astype(int).unique().tolist())
-                        cluster_label_to_id = {
-                            ("Noise (-1)" if cid == -1 else f"Cluster {cid}"): cid
-                            for cid in cluster_ids
-                        }
-                        cluster_options = ["All clusters"] + list(cluster_label_to_id.keys())
-                        selected_cluster_labels = st.multiselect(
-                            "Clusters",
-                            options=cluster_options,
-                            default=["All clusters"],
-                        )
+                        if len(cluster_ids) <= 1:
+                            st.caption("Cluster filter hidden (single cluster/noise group in this run).")
+                        else:
+                            cluster_label_to_id = {
+                                ("Noise (-1)" if cid == -1 else f"Cluster {cid}"): cid
+                                for cid in cluster_ids
+                            }
+                            cluster_options = ["All clusters"] + list(cluster_label_to_id.keys())
+                            selected_cluster_labels = st.multiselect(
+                                "Clusters",
+                                options=cluster_options,
+                                default=["All clusters"],
+                            )
                     else:
                         st.caption("No cluster_id column available; cluster filter disabled.")
 
-                selected_labels: list[str] = ["likely", "unlikely", "unknown"]
-                with filter_col3:
-                    if "analyst_label" in df.columns:
-                        label_options = ["likely", "unlikely", "unknown"]
-                        selected_labels = st.multiselect(
-                            "Analyst labels",
-                            options=label_options,
-                            default=label_options,
-                        )
-                    else:
-                        st.caption("No analyst labels yet.")
+                selected_labels: list[str] | None = None
+                if annotation_mode and filter_col3 is not None:
+                    with filter_col3:
+                        if "analyst_label" in df.columns:
+                            label_options = ["likely", "unlikely", "unknown"]
+                            selected_labels = st.multiselect(
+                                "Analyst labels",
+                                options=label_options,
+                                default=label_options,
+                            )
+                        else:
+                            st.caption("No analyst labels yet.")
 
                 min_prominence_filter: float | None = None
                 min_compactness_filter: float | None = None
@@ -2410,11 +2329,11 @@ with tab_results:
                     allowed_ids = [cluster_label_to_id[label] for label in selected_cluster_labels if label in cluster_label_to_id]
                     filtered_df = filtered_df[filtered_df["cluster_id"].isin(allowed_ids)]
 
-                if "analyst_label" in filtered_df.columns and selected_labels:
+                if annotation_mode and "analyst_label" in filtered_df.columns and selected_labels:
                     filtered_df = filtered_df[
                         filtered_df["analyst_label"].astype(str).str.lower().isin([s.lower() for s in selected_labels])
                     ]
-                elif "analyst_label" in filtered_df.columns and not selected_labels:
+                elif annotation_mode and "analyst_label" in filtered_df.columns and not selected_labels:
                     filtered_df = filtered_df.iloc[0:0]
 
                 if min_prominence_filter is not None and "prominence_m" in filtered_df.columns:
@@ -2436,7 +2355,25 @@ with tab_results:
             plots_dir = run_dir / "plots"
             img_dir = run_dir / "html" / "img"
 
-            res_tabs = st.tabs(["🗺️ Map", "🏷️ Top candidates", "📋 Table", "🧾 Report", "📄 Files", "📈 Plots"])
+            acct = {}
+            if isinstance(run_params_data, dict):
+                acct_raw = run_params_data.get("candidate_accounting")
+                if isinstance(acct_raw, dict):
+                    acct = acct_raw
+            dropped_edge = _to_int_or_none(acct.get("dropped_edge_buffer", used.get("dropped_edge")))
+            dropped_consensus = _to_int_or_none(acct.get("dropped_consensus_support", used.get("dropped_consensus")))
+            dropped_density = _to_int_or_none(acct.get("dropped_density", used.get("dropped_density")))
+            dropped_post = _to_int_or_none(acct.get("dropped_post_filters", used.get("dropped_post")))
+            dropped_spacing = _to_int_or_none(acct.get("dropped_spacing_dedup", used.get("dropped_spacing")))
+            kept = _to_int_or_none(acct.get("kept_candidates", used.get("candidates_kept")))
+
+            stage_metrics_raw = {}
+            if isinstance(run_params_data, dict):
+                sm = run_params_data.get("stage_metrics_sec")
+                if isinstance(sm, dict):
+                    stage_metrics_raw = sm
+
+            res_tabs = st.tabs(["🗺️ Map", "🏷️ Top candidates", "📋 Table", "🧾 Report", "🧪 Diagnostics", "📄 Files", "📈 Plots"])
 
             # --- Map (Leaflet: always works, Street + Satellite)
             with res_tabs[0]:
@@ -2488,14 +2425,46 @@ with tab_results:
                 else:
                     topn = min(30, len(filtered_df))
                     top = filtered_df.sort_values("score", ascending=False).head(topn).copy()
-                    st.dataframe(
-                        top[
-                            [c for c in [
-                                "cand_id","score","density","peak_relief_m","consensus_support","prominence_m","area_m2","extent","aspect","compactness","solidity","cluster_id","analyst_label","lat","lon"
-                            ] if c in top.columns]
-                        ],
-                        use_container_width=True,
-                    )
+                    top_base_cols = [
+                        "cand_id",
+                        "score",
+                        "density",
+                        "peak_relief_m",
+                        "consensus_support",
+                        "prominence_m",
+                        "area_m2",
+                        "extent",
+                        "aspect",
+                        "compactness",
+                        "solidity",
+                        "cluster_id",
+                        "lat",
+                        "lon",
+                    ]
+                    if annotation_mode:
+                        top_base_cols.insert(12, "analyst_label")
+                    top_cols = [
+                        c
+                        for c in top_base_cols
+                        if c in top.columns
+                    ]
+                    top_display = top[top_cols].copy()
+                    for fcol, ndigits in {
+                        "score": 3,
+                        "density": 3,
+                        "peak_relief_m": 2,
+                        "prominence_m": 2,
+                        "area_m2": 1,
+                        "extent": 3,
+                        "aspect": 2,
+                        "compactness": 3,
+                        "solidity": 3,
+                        "lat": 6,
+                        "lon": 6,
+                    }.items():
+                        if fcol in top_display.columns:
+                            top_display[fcol] = pd.to_numeric(top_display[fcol], errors="coerce").round(ndigits)
+                    st.dataframe(top_display, width="stretch", hide_index=True)
 
                     if "cand_id" not in top.columns:
                         st.info("No cand_id column available for candidate inspection.")
@@ -2527,101 +2496,117 @@ with tab_results:
 
                             selected_row = top_view[top_view["_cand_id_int"] == int(selected_cid)].iloc[0]
                             st.markdown("#### Candidate detail")
-                            d1, d2, d3, d4, d5, d6, d7, d8 = st.columns(8)
-                            d1.metric("Score", f"{float(selected_row['score']):.3f}" if "score" in selected_row else "—")
-                            d2.metric("Peak relief (m)", f"{float(selected_row['peak_relief_m']):.2f}" if "peak_relief_m" in selected_row else "—")
-                            d3.metric("Support", f"{int(selected_row['consensus_support'])}" if "consensus_support" in selected_row and pd.notna(selected_row["consensus_support"]) else "—")
-                            d4.metric("Prominence (m)", f"{float(selected_row['prominence_m']):.2f}" if "prominence_m" in selected_row else "—")
-                            d5.metric("Area (m²)", f"{float(selected_row['area_m2']):.1f}" if "area_m2" in selected_row else "—")
-                            d6.metric("Extent", f"{float(selected_row['extent']):.3f}" if "extent" in selected_row else "—")
-                            d7.metric("Compactness", f"{float(selected_row['compactness']):.3f}" if "compactness" in selected_row else "—")
-                            d8.metric("Solidity", f"{float(selected_row['solidity']):.3f}" if "solidity" in selected_row else "—")
-                            if "cluster_id" in selected_row and pd.notna(selected_row["cluster_id"]):
-                                st.caption(f"Cluster: {int(selected_row['cluster_id'])}")
+                            detail_tab_labels = ["Summary"]
+                            if annotation_mode:
+                                detail_tab_labels.append("Label")
+                            detail_tab_labels.extend(["Explainability", "Panel"])
+                            detail_tabs = st.tabs(detail_tab_labels)
+                            explain_idx = 2 if annotation_mode else 1
+                            panel_idx = 3 if annotation_mode else 2
 
-                            if "lat" in selected_row and "lon" in selected_row and pd.notna(selected_row["lat"]) and pd.notna(selected_row["lon"]):
-                                lat = float(selected_row["lat"])
-                                lon = float(selected_row["lon"])
-                                st.markdown(f"[Open in Google Maps](https://www.google.com/maps?q={lat:.8f},{lon:.8f})")
+                            with detail_tabs[0]:
+                                s1, s2, s3, s4 = st.columns(4)
+                                s1.metric("Score", f"{float(selected_row['score']):.3f}" if "score" in selected_row else "—")
+                                s2.metric("Peak relief (m)", f"{float(selected_row['peak_relief_m']):.2f}" if "peak_relief_m" in selected_row else "—")
+                                s3.metric("Support", f"{int(selected_row['consensus_support'])}" if "consensus_support" in selected_row and pd.notna(selected_row["consensus_support"]) else "—")
+                                s4.metric("Prominence (m)", f"{float(selected_row['prominence_m']):.2f}" if "prominence_m" in selected_row else "—")
+                                s5, s6, s7, s8 = st.columns(4)
+                                s5.metric("Area (m²)", f"{float(selected_row['area_m2']):.1f}" if "area_m2" in selected_row else "—")
+                                s6.metric("Extent", f"{float(selected_row['extent']):.3f}" if "extent" in selected_row else "—")
+                                s7.metric("Compactness", f"{float(selected_row['compactness']):.3f}" if "compactness" in selected_row else "—")
+                                s8.metric("Solidity", f"{float(selected_row['solidity']):.3f}" if "solidity" in selected_row else "—")
+                                if "cluster_id" in selected_row and pd.notna(selected_row["cluster_id"]):
+                                    st.caption(f"Cluster: {int(selected_row['cluster_id'])}")
+                                if "lat" in selected_row and "lon" in selected_row and pd.notna(selected_row["lat"]) and pd.notna(selected_row["lon"]):
+                                    lat = float(selected_row["lat"])
+                                    lon = float(selected_row["lon"])
+                                    st.markdown(f"[Open in Google Maps](https://www.google.com/maps?q={lat:.8f},{lon:.8f})")
 
-                            st.markdown("##### Analyst label")
-                            cur_label = str(selected_row.get("analyst_label", "unknown")).strip().lower()
-                            if cur_label not in {"likely", "unlikely", "unknown"}:
-                                cur_label = "unknown"
-                            cur_note = str(selected_row.get("analyst_note", "") or "")
-                            cur_updated = str(selected_row.get("analyst_updated_utc", "") or "")
-                            label_options = ["unknown", "likely", "unlikely"]
-                            default_idx = label_options.index(cur_label) if cur_label in label_options else 0
+                            if annotation_mode:
+                                with detail_tabs[1]:
+                                    cur_label = str(selected_row.get("analyst_label", "unknown")).strip().lower()
+                                    if cur_label not in {"likely", "unlikely", "unknown"}:
+                                        cur_label = "unknown"
+                                    cur_note = str(selected_row.get("analyst_note", "") or "")
+                                    cur_updated = str(selected_row.get("analyst_updated_utc", "") or "")
+                                    label_options = ["unknown", "likely", "unlikely"]
+                                    default_idx = label_options.index(cur_label) if cur_label in label_options else 0
 
-                            with st.form(key=f"label_form_{run_dir.name}_{int(selected_cid)}", clear_on_submit=False):
-                                new_label = st.selectbox("Classification", options=label_options, index=default_idx)
-                                new_note = st.text_input("Notes (optional)", value=cur_note, max_chars=500)
-                                save_label = st.form_submit_button("Save label")
+                                    with st.form(key=f"label_form_{run_dir.name}_{int(selected_cid)}", clear_on_submit=False):
+                                        new_label = st.selectbox("Classification", options=label_options, index=default_idx)
+                                        new_note = st.text_input("Notes (optional)", value=cur_note, max_chars=500)
+                                        save_label = st.form_submit_button("Save label")
 
-                            if cur_updated:
-                                st.caption(f"Last label update: {cur_updated}")
+                                    if cur_updated:
+                                        st.caption(f"Last label update: {cur_updated}")
 
-                            if save_label:
-                                lat_v = _to_float_or_none(selected_row.get("lat"))
-                                lon_v = _to_float_or_none(selected_row.get("lon"))
-                                score_v = _to_float_or_none(selected_row.get("score"))
-                                labels_path = upsert_candidate_label(
-                                    run_dir=run_dir,
-                                    cand_id=int(selected_cid),
-                                    label=new_label,
-                                    note=new_note,
-                                    lat=lat_v,
-                                    lon=lon_v,
-                                    score=score_v,
-                                )
-                                st.success(f"Saved label to {labels_path.name}.")
-                                st.rerun()
+                                    if save_label:
+                                        lat_v = _to_float_or_none(selected_row.get("lat"))
+                                        lon_v = _to_float_or_none(selected_row.get("lon"))
+                                        score_v = _to_float_or_none(selected_row.get("score"))
+                                        labels_path = upsert_candidate_label(
+                                            run_dir=run_dir,
+                                            cand_id=int(selected_cid),
+                                            label=new_label,
+                                            note=new_note,
+                                            lat=lat_v,
+                                            lon=lon_v,
+                                            score=score_v,
+                                        )
+                                        st.success(f"Saved label to {labels_path.name}.")
+                                        st.rerun()
 
-                            breakdown = score_breakdown_df(selected_row, run_params_data)
-                            if breakdown is not None:
-                                st.markdown("##### Score explainability")
-                                st.dataframe(
-                                    breakdown[["component", "raw_value", "exponent", "term"]],
-                                    use_container_width=True,
-                                    hide_index=True,
-                                )
-                                st.bar_chart(
-                                    breakdown.set_index("component")[["term_norm"]],
-                                    use_container_width=True,
-                                )
-                                est_score = float(breakdown.attrs.get("estimated_score", 0.0))
-                                obs_score = _to_float_or_none(selected_row.get("score"))
-                                if obs_score is not None:
-                                    st.caption(
-                                        f"Estimated score from components: {est_score:.6f} | "
-                                        f"Observed score: {obs_score:.6f}."
+                            with detail_tabs[explain_idx]:
+                                breakdown = score_breakdown_df(selected_row, run_params_data)
+                                if breakdown is not None:
+                                    st.dataframe(
+                                        breakdown[["component", "raw_value", "exponent", "term"]],
+                                        width="stretch",
+                                        hide_index=True,
                                     )
-
-                            if img_dir.exists():
-                                panel_path = img_dir / f"cand_{int(selected_cid):04d}_panel.png"
-                                if panel_path.exists():
-                                    st.image(
-                                        str(panel_path),
-                                        caption=f"Candidate {int(selected_cid)} panel (LRM + hillshade)",
-                                        use_container_width=True,
+                                    st.bar_chart(
+                                        breakdown.set_index("component")[["term_norm"]],
+                                        width="stretch",
                                     )
+                                    est_score = float(breakdown.attrs.get("estimated_score", 0.0))
+                                    obs_score = _to_float_or_none(selected_row.get("score"))
+                                    if obs_score is not None:
+                                        st.caption(
+                                            f"Estimated score from components: {est_score:.6f} | "
+                                            f"Observed score: {obs_score:.6f}."
+                                        )
+                                else:
+                                    st.caption("Score breakdown is unavailable for this candidate row.")
+
+                            with detail_tabs[panel_idx]:
+                                if img_dir.exists():
+                                    panel_path = img_dir / f"cand_{int(selected_cid):04d}_panel.png"
+                                    if panel_path.exists():
+                                        try:
+                                            st.image(
+                                                str(panel_path),
+                                                caption=f"Candidate {int(selected_cid)} panel (LRM + hillshade)",
+                                                width="stretch",
+                                            )
+                                        except Exception:
+                                            st.warning(f"Candidate panel could not be displayed: `{panel_path.name}`")
+                                    else:
+                                        render_hint_block(
+                                            "No cutout panel found for this candidate.",
+                                            [
+                                                "Only top-ranked candidates get cutouts.",
+                                                "Increase `Featured candidates (Top N)` and rerun.",
+                                                "Ensure HTML output is enabled (disable `Skip HTML report`).",
+                                            ],
+                                        )
                                 else:
                                     render_hint_block(
-                                        "No cutout panel found for this candidate.",
+                                        "No cutout image folder found for this run.",
                                         [
-                                            "Only top-ranked candidates get cutouts.",
-                                            "Increase `Featured candidates (Top N)` and rerun.",
-                                            "Ensure HTML output is enabled (disable `Skip HTML report`).",
+                                            "Enable HTML output and rerun to generate cutouts.",
                                         ],
+                                        level="warning",
                                     )
-                            else:
-                                render_hint_block(
-                                    "No cutout image folder found for this run.",
-                                    [
-                                        "Enable HTML output and rerun to generate cutouts.",
-                                    ],
-                                    level="warning",
-                                )
 
             # --- Table
             with res_tabs[2]:
@@ -2631,19 +2616,55 @@ with tab_results:
                     else:
                         st.info("No candidates.csv found yet.")
                 else:
-                    st.dataframe(filtered_df.sort_values("score", ascending=False), use_container_width=True)
+                    table_df = filtered_df.sort_values("score", ascending=False).copy()
+                    for fcol, ndigits in {
+                        "score": 3,
+                        "density": 3,
+                        "peak_relief_m": 2,
+                        "prominence_m": 2,
+                        "area_m2": 1,
+                        "extent": 3,
+                        "aspect": 2,
+                        "compactness": 3,
+                        "solidity": 3,
+                        "lat": 6,
+                        "lon": 6,
+                    }.items():
+                        if fcol in table_df.columns:
+                            table_df[fcol] = pd.to_numeric(table_df[fcol], errors="coerce").round(ndigits)
+                    st.dataframe(table_df, width="stretch", hide_index=True)
 
             # --- Report
             with res_tabs[3]:
                 if report_html.exists():
                     st.markdown("#### Report (interactive)")
+                    rcol1, rcol2 = st.columns([1, 2])
+                    with rcol1:
+                        st.download_button(
+                            "Download report.html",
+                            data=report_html.read_bytes(),
+                            file_name=report_html.name,
+                            mime="text/html",
+                            key=f"download_report_tab_{run_dir.name}",
+                        )
+                    with rcol2:
+                        st.caption(f"Source file: `{report_html}`")
+
+                    report_height = st.slider(
+                        "Report viewport height (px)",
+                        min_value=780,
+                        max_value=1800,
+                        value=1240,
+                        step=40,
+                        key=f"report_height_{run_dir.name}",
+                    )
                     html_inlined = inline_report_images_and_basemap(
                         str(report_html),
                         str(run_dir),
                         report_html.stat().st_mtime_ns,
                     )
                     if html_inlined.strip():
-                        components.html(html_inlined, height=980, scrolling=True)
+                        components.html(html_inlined, height=int(report_height), scrolling=True)
                     else:
                         st.warning("report.html exists but could not be loaded as text.")
                 else:
@@ -2655,8 +2676,112 @@ with tab_results:
                         ],
                     )
 
-            # --- Files
+            # --- Diagnostics
             with res_tabs[4]:
+                st.markdown("#### Diagnostics")
+                with st.expander("Quality rationale", expanded=False):
+                    for label, ok in quality["checks"]:
+                        st.write(f"{'✅' if ok else '⚠️'} {label}")
+                    st.caption("This is a triage heuristic for review confidence, not archaeological validation.")
+
+                if annotation_mode:
+                    st.caption("Analyst labels are manual review notes and are not used as a primary run-quality metric.")
+
+                if any(v is not None for v in [dropped_edge, dropped_consensus, dropped_density, dropped_post, dropped_spacing, kept]):
+                    st.markdown("##### Filter waterfall")
+                    wf_rows = [
+                        {"stage": "Dropped edge", "count": int(dropped_edge or 0)},
+                        {"stage": "Dropped consensus", "count": int(dropped_consensus or 0)},
+                        {"stage": "Dropped density", "count": int(dropped_density or 0)},
+                        {"stage": "Dropped post-filters", "count": int(dropped_post or 0)},
+                        {"stage": "Dropped spacing dedup", "count": int(dropped_spacing or 0)},
+                        {"stage": "Kept candidates", "count": int(kept or 0)},
+                    ]
+                    wf_df = pd.DataFrame(wf_rows)
+                    st.bar_chart(wf_df.set_index("stage"), width="stretch")
+                    st.caption("Use this to diagnose whether strictness is coming from edge/density/shape/spacing filters.")
+                    tuning_hints = tuning_hints_from_filter_waterfall(
+                        dropped_edge=dropped_edge,
+                        dropped_consensus=dropped_consensus,
+                        dropped_density=dropped_density,
+                        dropped_post=dropped_post,
+                        dropped_spacing=dropped_spacing,
+                        kept=kept,
+                    )
+                    if tuning_hints:
+                        render_hint_block("Tuning suggestions from this run", tuning_hints, level="info")
+
+                if stage_metrics_raw:
+                    stage_rows: list[dict[str, object]] = []
+                    for k, v in stage_metrics_raw.items():
+                        try:
+                            fv = float(v)
+                        except Exception:
+                            continue
+                        stage_rows.append({"stage": str(k), "seconds": fv})
+                    if stage_rows:
+                        stage_df = pd.DataFrame(stage_rows).sort_values("seconds", ascending=False)
+                        st.markdown("##### Runtime profile")
+                        st.bar_chart(stage_df.set_index("stage")[["seconds"]], width="stretch")
+                        total_rt = next((r["seconds"] for r in stage_rows if str(r["stage"]) == "total_runtime_sec"), None)
+                        if isinstance(total_rt, float):
+                            st.caption(f"Total runtime: {total_rt:.2f} sec")
+
+                if not portfolio_mode:
+                    with st.expander("Run settings used", expanded=False):
+                        settings_data: dict[str, object] = {"run_dir": str(run_dir)}
+                        settings_data["ui_preset_selected"] = st.session_state.get("last_preset_selected")
+                        settings_data["ui_preset_match"] = st.session_state.get("last_preset_match")
+                        if st.session_state.last_cmd:
+                            settings_data["command"] = parse_cmd_settings(st.session_state.last_cmd)
+                        if st.session_state.get("last_ui_config"):
+                            settings_data["ui_config_snapshot"] = st.session_state["last_ui_config"]
+                        if run_params_data is not None:
+                            settings_data["run_params_json"] = run_params_data
+                        if used:
+                            settings_data["resolved_from_log"] = {
+                                "relief_threshold_m": used.get("pos_thresh_m"),
+                                "relief_threshold_spec": used.get("pos_thresh_spec"),
+                                "min_density": used.get("min_density"),
+                                "min_density_spec": used.get("min_density_spec"),
+                                "dbscan_eps_m": used.get("dbscan_eps_m"),
+                                "dbscan_min_samples": used.get("dbscan_min_samples"),
+                                "candidates_kept": used.get("candidates_kept"),
+                                "clusters_found": used.get("clusters_found"),
+                                "clusters_noise": used.get("clusters_noise"),
+                                "dropped_edge": used.get("dropped_edge"),
+                                "dropped_consensus": used.get("dropped_consensus"),
+                                "dropped_density": used.get("dropped_density"),
+                                "dropped_post": used.get("dropped_post"),
+                                "dropped_spacing": used.get("dropped_spacing"),
+                            }
+
+                        report_md_path = run_dir / "report.md"
+                        if report_md_path.exists():
+                            m = re.search(r"- Input:\s*`([^`]+)`", read_text_safely(report_md_path))
+                            if m:
+                                settings_data["input"] = m.group(1)
+                        st.json(settings_data)
+
+                with st.expander("Provenance (copy / paste)", expanded=False):
+                    prov_text = build_provenance_text(
+                        run_dir=run_dir,
+                        command=st.session_state.last_cmd,
+                        used=used,
+                        run_params_data=run_params_data,
+                        preset_name=st.session_state.get("last_preset_selected"),
+                        preset_match=st.session_state.get("last_preset_match"),
+                    )
+                    st.text_area("Provenance block", value=prov_text, height=220, key=f"prov_{run_dir.name}")
+                    st.download_button(
+                        "Download provenance.txt",
+                        data=prov_text.encode("utf-8"),
+                        file_name=f"{run_dir.name}_provenance.txt",
+                        mime="text/plain",
+                    )
+
+            # --- Files
+            with res_tabs[5]:
                 st.markdown("#### Key outputs")
                 st.code(str(run_dir), language="text")
 
@@ -2673,7 +2798,7 @@ with tab_results:
                         )
                     else:
                         st.warning("candidates.csv not found")
-                    if labels_csv.exists():
+                    if annotation_mode and labels_csv.exists():
                         st.success("candidate_labels.csv")
                         st.download_button(
                             "Download candidate_labels.csv",
@@ -2755,17 +2880,22 @@ with tab_results:
                     st.caption('Click "Prepare run outputs (.zip)" to generate the archive.')
 
             # --- Plots
-            with res_tabs[5]:
+            with res_tabs[6]:
                 st.markdown("#### Plots")
                 if plots_dir.exists():
-                    # In case they appear a beat late
                     time.sleep(0.15)
                     pngs = sorted(plots_dir.glob("*.png"))
                     if not pngs:
                         st.info("No plot PNGs found.")
                     else:
                         for p in pngs:
-                            st.image(str(p), caption=p.name, use_container_width=True)
+                            if not wait_for_file(p, timeout_s=2.0, poll_s=0.1):
+                                st.caption(f"Skipping plot not ready yet: `{p.name}`")
+                                continue
+                            try:
+                                st.image(str(p), caption=p.name, width="stretch")
+                            except Exception:
+                                st.warning(f"Skipped unreadable plot image: `{p.name}`")
                 else:
                     st.info("plots/ folder not found.")
 
@@ -2805,7 +2935,7 @@ with tab_compare:
             st.markdown("#### Visual bars")
             bar_cols = [c for c in ["candidates", "clusters", "top_score", "mean_score"] if c in cmp_df.columns]
             if bar_cols and "preset" in cmp_df.columns:
-                st.bar_chart(cmp_df.set_index("preset")[bar_cols], use_container_width=True)
+                st.bar_chart(cmp_df.set_index("preset")[bar_cols], width="stretch")
             else:
                 st.info("No plottable comparison metrics found.")
 
@@ -2854,7 +2984,28 @@ with tab_compare:
                 if c in cmp_df.columns
             ]
             if show_cols:
-                st.dataframe(cmp_df[show_cols], use_container_width=True)
+                st.dataframe(cmp_df[show_cols], width="stretch")
+
+            if "run_dir" in cmp_df.columns and "preset" in cmp_df.columns:
+                st.markdown("#### Open one compared run in Results")
+                run_options: dict[str, str] = {}
+                for _, row in cmp_df.iterrows():
+                    preset_label = str(row.get("preset", "preset"))
+                    run_name_label = str(row.get("run_name", "run"))
+                    run_dir_label = str(row.get("run_dir", ""))
+                    if not run_dir_label:
+                        continue
+                    run_options[f"{preset_label} — {run_name_label}"] = run_dir_label
+                if run_options:
+                    selected_run_label = st.selectbox(
+                        "Comparison run",
+                        options=list(run_options.keys()),
+                        key="cmp_run_selector",
+                    )
+                    if st.button("Load selected comparison run", key="load_cmp_run_btn"):
+                        st.session_state.last_run_dir = run_options[selected_run_label]
+                        st.success(f"Loaded `{selected_run_label}` into Results.")
+                        st.rerun()
 
         cjson = compare_summary.get("comparison_json")
         cmd = compare_summary.get("comparison_md")

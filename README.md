@@ -65,7 +65,7 @@ Using multi-scale relief analysis and spatial density modeling, MayaScan highlig
 - Run-quality badge + reproducibility provenance block
 - Filter-waterfall diagnostics (edge/consensus/density/post/spacing)
 - Candidate score explainability (component-level contribution view)
-- In-app analyst labeling + label-guided precision metrics
+- Optional annotation mode for analyst labels + notes (`likely` / `unlikely` / `unknown`)
 - Runtime profiling by pipeline stage
 - Interactive HTML reports with cutouts and metrics
 - GIS-ready exports (CSV, GeoJSON, KML)
@@ -141,7 +141,7 @@ A lightweight Streamlit UI wraps the CLI pipeline so you can upload a `.laz/.las
 - Filter waterfall panel (edge/consensus/density/post-filter/spacing drop counts)
 - Automated parameter tuning hints from waterfall outcomes
 - Candidate score breakdown panel (component-level contribution view)
-- Candidate-detail analyst labels (`likely` / `unlikely` / `unknown`) + notes
+- Optional annotation mode (off by default) for candidate-detail analyst labels + notes
 - Optional portfolio mode to hide diagnostics-heavy sections
 - Interactive Leaflet map (Street + Satellite basemap toggle, no API keys)
 - Ranked candidates table

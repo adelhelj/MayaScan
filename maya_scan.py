@@ -1352,7 +1352,6 @@ def write_report_md(
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     sorted_c = sorted(candidates, key=lambda c: c.score, reverse=True)
     top = sorted_c[: params.report_top_n]
-
     n_clusters = len({c.cluster_id for c in candidates if c.cluster_id != -1})
     n_noise = sum(1 for c in candidates if c.cluster_id == -1)
 
@@ -1628,6 +1627,11 @@ def write_html_report(
 
     sorted_c = sorted(candidates, key=lambda c: c.score, reverse=True)
     top = sorted_c[: params.report_top_n]
+    n_clusters = len({c.cluster_id for c in candidates if c.cluster_id != -1})
+    n_noise = sum(1 for c in candidates if c.cluster_id == -1)
+    top_score = float(sorted_c[0].score) if sorted_c else 0.0
+    median_score = float(np.median([c.score for c in sorted_c])) if sorted_c else 0.0
+    mean_support = float(np.mean([c.consensus_support for c in sorted_c])) if sorted_c else 0.0
 
     points = []
     for c in sorted_c:
@@ -1662,46 +1666,83 @@ def write_html_report(
 <script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>
 
 <style>
-body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 18px; color: #111; }}
+:root {{
+  --ink: #111827;
+  --muted: #4b5563;
+  --border: #e5e7eb;
+  --bg: #f7f8fa;
+  --card: #ffffff;
+  --accent: #0b63ce;
+}}
+body {{ font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 0; color: var(--ink); background: var(--bg); }}
+.wrap {{ max-width: 1240px; margin: 0 auto; padding: 18px; }}
 h1 {{ margin: 0 0 8px 0; }}
-.small {{ color: #444; }}
-#map {{ height: 520px; border: 1px solid #ddd; border-radius: 10px; margin: 14px 0; }}
+h2 {{ margin: 16px 0 8px 0; }}
+h3 {{ margin: 0 0 8px 0; }}
+.small {{ color: var(--muted); }}
+#map {{ height: 520px; border: 1px solid var(--border); border-radius: 12px; margin: 14px 0; background: #fff; }}
 .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }}
-.card {{ border: 1px solid #e5e5e5; border-radius: 12px; padding: 12px; background: #fff; }}
-.hr {{ border-top: 1px solid #eee; margin: 18px 0; }}
-a {{ color: #0b63ce; text-decoration: none; }}
+.card {{ border: 1px solid var(--border); border-radius: 12px; padding: 12px; background: var(--card); }}
+.hr {{ border-top: 1px solid var(--border); margin: 18px 0; }}
+a {{ color: var(--accent); text-decoration: none; }}
 a:hover {{ text-decoration: underline; }}
-img {{ max-width: 100%; border: 1px solid #ddd; border-radius: 10px; }}
+img {{ max-width: 100%; border: 1px solid var(--border); border-radius: 10px; }}
 table {{ width: 100%; border-collapse: collapse; }}
-th, td {{ padding: 8px; border-bottom: 1px solid #eee; font-size: 14px; }}
+th, td {{ padding: 8px; border-bottom: 1px solid var(--border); font-size: 14px; }}
 th {{ text-align: left; background: #fafafa; position: sticky; top: 0; }}
-.badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px; background: #f2f2f2; font-size: 12px; }}
+.badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px; background: #eef2f7; font-size: 12px; }}
 .topnote {{ margin-top: 8px; }}
+.kpis {{ display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }}
+.kpi {{ border: 1px solid var(--border); border-radius: 10px; background: #fff; padding: 10px; }}
+.kpi .k {{ display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }}
+.kpi .v {{ display: block; font-size: 22px; font-weight: 700; }}
+.candidate-card {{ border: 1px solid var(--border); border-radius: 12px; padding: 12px; background: #fff; margin: 0 0 14px 0; }}
+.metric-grid {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin: 10px 0; }}
+.metric-chip {{ border: 1px solid var(--border); border-radius: 10px; padding: 8px; background: #fafafa; }}
+.metric-chip .mk {{ display: block; font-size: 11px; color: var(--muted); }}
+.metric-chip .mv {{ display: block; font-size: 15px; font-weight: 600; }}
+details.card summary {{ cursor: pointer; font-weight: 600; }}
+
+@media (max-width: 1000px) {{
+  .grid {{ grid-template-columns: 1fr; }}
+  .kpis {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+  .metric-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+  #map {{ height: 460px; }}
+}}
 </style>
 
-</head><body>
+</head><body><div class='wrap'>
 <h1>MayaScan Report — {html.escape(run_name)}</h1>
 <div class='small'>Timestamp: <b>{ts}</b> &nbsp;|&nbsp; Input: <code>{html.escape(str(input_path))}</code></div>
 <div class='topnote small'>
 pos_relief_threshold: <b>{pos_thresh:.4f} m</b> ({html.escape(params.pos_relief_threshold_spec)}) &nbsp;|&nbsp;
 min_density: <b>{min_density:.4f}</b> ({html.escape(params.min_density_spec)}) &nbsp;|&nbsp;
-candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.kml_label_top_n}</b>
+KML labels: top <b>{params.kml_label_top_n}</b>
+</div>
+
+<div class='kpis'>
+  <div class='kpi'><span class='k'>Candidates</span><span class='v'>{len(candidates)}</span></div>
+  <div class='kpi'><span class='k'>Clusters</span><span class='v'>{n_clusters}</span></div>
+  <div class='kpi'><span class='k'>Noise points</span><span class='v'>{n_noise}</span></div>
+  <div class='kpi'><span class='k'>Top score</span><span class='v'>{top_score:.3f}</span></div>
+  <div class='kpi'><span class='k'>Median score</span><span class='v'>{median_score:.3f}</span></div>
+  <div class='kpi'><span class='k'>Mean support</span><span class='v'>{mean_support:.2f}</span></div>
 </div>
 
 <div id='map'></div>
 
 <div class='grid'>
-  <div class='card'>
-    <h3 style='margin-top:0'>How to triage</h3>
+  <details class='card' open>
+    <summary>How to triage</summary>
     <ol class='small'>
-      <li>Scan the map for clusters / linear terrace patterns.</li>
-      <li>Click a marker: popups show score + quick cutout if available.</li>
-      <li>Open high scorers in Google Maps / Google Earth (KML) and compare LRM texture.</li>
-      <li>Favor coherent shapes (rectilinear platforms, aligned mounds, terrace lines).</li>
+      <li>Scan the map for clusters and repeated platform-like forms.</li>
+      <li>Click markers to review score, shape metrics, and cutout panel.</li>
+      <li>Start review from top score, then confirm with LRM and hillshade texture.</li>
+      <li>Use GIS exports + report assets for deeper interpretation workflow.</li>
     </ol>
-  </div>
-  <div class='card'>
-    <h3 style='margin-top:0'>Files</h3>
+  </details>
+  <details class='card'>
+    <summary>Files in this run</summary>
     <ul class='small'>
       <li><code>candidates.csv</code>, <code>candidates.geojson</code>, <code>candidates.kml</code></li>
       <li><code>dtm.tif</code>, <code>lrm.tif</code>, <code>mound_density.tif</code></li>
@@ -1709,12 +1750,12 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
       <li><code>plots/</code> (density, overlay, histograms)</li>
       <li><code>html/img/</code> (candidate cutouts)</li>
     </ul>
-  </div>
+  </details>
 </div>
 
 <div class='hr'></div>
 <h2>Top candidates</h2>
-<div class='small'>Click coordinates to open in Google Maps. Images show LRM + hillshade panel (when generated).</div>
+<div class='small'>Click coordinates to open in Google Maps. Images show LRM + hillshade panels when available.</div>
 <div class='hr'></div>
 """
 
@@ -1724,18 +1765,31 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
         if c.img_relpath:
             img_tag = f"<img src='{html.escape(c.img_relpath)}' alt='candidate {c.cand_id} cutout'/>"
         doc += f"""
-<h3>Candidate {c.cand_id} <span class='badge'>rank {rank}</span> — score {c.score:.3f}</h3>
-<p><b>dens</b> {c.density:.3f} | <b>peak</b> {c.peak_relief_m:.2f} m | <b>support</b> {c.consensus_support} | <b>prom</b> {c.prominence_m:.2f} m | <b>area</b> {c.area_m2:.0f} m² |
-<b>extent</b> {c.extent:.2f} | <b>aspect</b> {c.aspect:.2f} | <b>compactness</b> {c.compactness:.2f} | <b>solidity</b> {c.solidity:.2f} | <b>cluster</b> {c.cluster_id}</p>
-<p><a href='{gmaps}' target='_blank'>{c.lat:.6f}, {c.lon:.6f}</a></p>
-{img_tag}
-<div class='hr'></div>
+<div class='candidate-card'>
+  <h3>Candidate {c.cand_id} <span class='badge'>rank {rank}</span> — score {c.score:.3f}</h3>
+  <div class='metric-grid'>
+    <div class='metric-chip'><span class='mk'>density</span><span class='mv'>{c.density:.3f}</span></div>
+    <div class='metric-chip'><span class='mk'>peak (m)</span><span class='mv'>{c.peak_relief_m:.2f}</span></div>
+    <div class='metric-chip'><span class='mk'>support</span><span class='mv'>{c.consensus_support}</span></div>
+    <div class='metric-chip'><span class='mk'>prominence (m)</span><span class='mv'>{c.prominence_m:.2f}</span></div>
+    <div class='metric-chip'><span class='mk'>area (m²)</span><span class='mv'>{c.area_m2:.0f}</span></div>
+    <div class='metric-chip'><span class='mk'>extent</span><span class='mv'>{c.extent:.2f}</span></div>
+    <div class='metric-chip'><span class='mk'>aspect</span><span class='mv'>{c.aspect:.2f}</span></div>
+    <div class='metric-chip'><span class='mk'>compactness</span><span class='mv'>{c.compactness:.2f}</span></div>
+    <div class='metric-chip'><span class='mk'>solidity</span><span class='mv'>{c.solidity:.2f}</span></div>
+    <div class='metric-chip'><span class='mk'>cluster</span><span class='mv'>{c.cluster_id}</span></div>
+  </div>
+  <p class='small'><a href='{gmaps}' target='_blank'>{c.lat:.6f}, {c.lon:.6f}</a></p>
+  {img_tag}
+</div>
 """
 
     doc += """
 <h2>All candidates</h2>
-<div class='small'>Sorted by score (descending). Map includes all points.</div>
-<div class='card' style='max-height:520px; overflow:auto;'>
+<details class='card' open>
+<summary>Full candidate table (sorted by score)</summary>
+<div class='small' style='margin:8px 0 10px 0;'>Map includes all points. Use this table for exhaustive review and exports.</div>
+<div style='max-height:520px; overflow:auto;'>
 <table>
 <thead>
 <tr>
@@ -1767,7 +1821,7 @@ candidates: <b>{len(candidates)}</b> &nbsp;|&nbsp; KML labels: top <b>{params.km
         )
 
     doc += f"""
-</tbody></table></div>
+</tbody></table></div></details>
 
 <script>
 const points = {s_points};
@@ -1829,7 +1883,7 @@ if (bounds.length > 0) {{
 }}
 </script>
 
-</body></html>
+</div></body></html>
 """
     html_path.write_text(doc, encoding="utf-8")
     return html_path
