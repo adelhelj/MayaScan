@@ -80,7 +80,7 @@ This project is intended for research, education, and software engineering demon
 - MayaScan identifies **terrain anomalies**, not confirmed archaeological sites.
 - Results require **expert review and ground validation**.
 - Location information should be handled responsibly to avoid site disturbance or looting.
-- This repository **does not include LiDAR datasets or derived site location outputs**.
+- This repository includes one small test tile (`data/lidar/sample.laz`, Belize/Caracol) for testing.
 - The project intentionally avoids publishing curated site interpretations or sensitive geographic information.
 
 This repository is shared as a **portfolio and technical demonstration** of geospatial terrain-processing workflows.
@@ -206,12 +206,17 @@ streamlit run app.py
 ```
 
 Then:
-1. Upload a `.laz/.las` tile (or use a local path)
+1. Upload a `.laz/.las` tile, or use the default local sample path `data/lidar/sample.laz`
 2. Pick a scientific preset (`Balanced` recommended) and set run name
 3. Click **Run MayaScan**
 4. Review map, ranked candidates, filter waterfall, and score breakdown in **Results**
 5. (Optional) Run **Preset comparison** and review deltas in the **Comparison** tab
 6. (Optional) Add analyst labels (`likely` / `unlikely` / `unknown`) to track triage outcomes over time.
+
+Quick smoke test (Belize/Caracol sample):
+- Keep local path set to `data/lidar/sample.laz`
+- Use a run name like `caracol_sample_test`
+- Click **Run MayaScan**
 
 Outputs are saved to:
 
@@ -221,20 +226,20 @@ runs/<run_name>/
 
 ## Quick Start (CLI)
 
-Place a LiDAR tile locally (example):
+Use the bundled Belize/Caracol sample tile:
 
 ```
-data/lidar/bz_hr_las31_crs.laz
+data/lidar/sample.laz
 ```
 
-(LiDAR data is not included in this repository.)
+You can replace this with your own local `.laz/.las` path at any time.
 
 Run MayaScan:
 
 ```bash
 python maya_scan.py \
-  -i data/lidar/bz_hr_las31_crs.laz \
-  --name example_run \
+  -i data/lidar/sample.laz \
+  --name caracol_sample_test \
   --overwrite \
   --try-smrf \
   --pos-thresh auto:p96 \
@@ -263,13 +268,13 @@ python maya_scan.py \
 Outputs will be written to:
 
 ```
-runs/example_run/
+runs/caracol_sample_test/
 ```
 
 Open the interactive report:
 
 ```
-runs/example_run/report.html
+runs/caracol_sample_test/report.html
 ```
 
 ---
@@ -357,6 +362,12 @@ Example workflow:
 
 ```
 data/lidar/
+```
+
+For a built-in smoke test, this repository already includes:
+
+```
+data/lidar/sample.laz
 ```
 
 ### API Access
@@ -470,7 +481,8 @@ MayaScan/
 ├── .gitignore
 └── data/
     └── lidar/
-        └── .gitkeep
+        ├── .gitkeep
+        └── sample.laz
 ```
 
 Generated locally (gitignored):
@@ -481,7 +493,7 @@ runs/*/candidate_labels.csv
 runs/*/run_params.json
 runs/*_preset_compare_*.json
 runs/*_preset_compare_*.md
-data/lidar/*.laz
+data/lidar/*.laz   # except data/lidar/sample.laz
 data/lidar/*.las
 data/lidar/*.tif
 ```

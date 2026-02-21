@@ -65,6 +65,9 @@ results/
 *.log
 *.html
 
+# Keep a small demo tile tracked for out-of-the-box runs
+!data/lidar/sample.laz
+
 # Keep repository media assets tracked
 !assets/
 !assets/**

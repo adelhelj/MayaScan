@@ -661,8 +661,6 @@ def assess_run_quality(used: dict, df: pd.DataFrame | None) -> dict[str, object]
     """
     Heuristic quality badge for triage confidence (not ground truth).
     """
-    checks: list[tuple[str, bool]] = []
-
     cand_count = _to_int_or_none(used.get("candidates_kept"))
     clusters = _to_int_or_none(used.get("clusters_found"))
     noise = _to_int_or_none(used.get("clusters_noise"))
@@ -674,14 +672,44 @@ def assess_run_quality(used: dict, df: pd.DataFrame | None) -> dict[str, object]
             top_score = float(s.max())
             median_score = float(s.median())
 
-    checks.append(("Candidate count in useful review range (8-250)", bool(cand_count is not None and 8 <= cand_count <= 250)))
-    checks.append(("At least one non-noise cluster", bool(clusters is not None and clusters >= 1)))
-    checks.append(("Top score >= 2.0", bool(top_score is not None and top_score >= 2.0)))
-    checks.append(("Median score >= 0.35", bool(median_score is not None and median_score >= 0.35)))
-
+    noise_frac = None
     if clusters is not None and noise is not None and cand_count and cand_count > 0:
         noise_frac = float(noise) / float(max(1, cand_count))
-        checks.append(("Noise fraction <= 0.70", noise_frac <= 0.70))
+
+    check_details: list[dict[str, object]] = [
+        {
+            "label": "Candidate count in useful review range",
+            "target": "8-250",
+            "observed": "—" if cand_count is None else str(cand_count),
+            "passed": (cand_count is not None and 8 <= cand_count <= 250),
+        },
+        {
+            "label": "At least one non-noise cluster",
+            "target": ">= 1 cluster",
+            "observed": "—" if clusters is None else str(clusters),
+            "passed": (clusters is not None and clusters >= 1),
+        },
+        {
+            "label": "Top score threshold",
+            "target": ">= 2.0",
+            "observed": "—" if top_score is None else f"{top_score:.3f}",
+            "passed": (top_score is not None and top_score >= 2.0),
+        },
+        {
+            "label": "Median score threshold",
+            "target": ">= 0.35",
+            "observed": "—" if median_score is None else f"{median_score:.3f}",
+            "passed": (median_score is not None and median_score >= 0.35),
+        },
+        {
+            "label": "Noise fraction threshold",
+            "target": "<= 0.70",
+            "observed": "—" if noise_frac is None else f"{noise_frac:.3f}",
+            "passed": (None if noise_frac is None else noise_frac <= 0.70),
+        },
+    ]
+
+    checks = [(str(c["label"]), bool(c["passed"])) for c in check_details if c.get("passed") is not None]
 
     total = len(checks)
     passed = sum(1 for _, ok in checks if ok)
@@ -707,6 +735,7 @@ def assess_run_quality(used: dict, df: pd.DataFrame | None) -> dict[str, object]
         "passed": passed,
         "total": total,
         "checks": checks,
+        "check_details": check_details,
         "candidate_count": cand_count,
         "clusters": clusters,
         "noise": noise,
@@ -781,7 +810,7 @@ def tuning_hints_from_filter_waterfall(
     return hints[:4]
 
 
-def score_breakdown_df(row: pd.Series, run_params_data: dict | None) -> pd.DataFrame | None:
+def score_formula_strings(run_params_data: dict | None) -> tuple[dict[str, float], str, str, str]:
     params = {}
     if isinstance(run_params_data, dict):
         p = run_params_data.get("params")
@@ -798,6 +827,91 @@ def score_breakdown_df(row: pd.Series, run_params_data: dict | None) -> pd.DataF
         "solidity": float(params.get("score_solidity_exp", 0.20)),
         "area_m2": float(params.get("score_area_exp", 0.50)),
     }
+    a = exps["density"]
+    b = exps["peak_relief_m"]
+    c = exps["extent"]
+    d = exps["consensus_support"]
+    e = exps["prominence_m"]
+    f = exps["compactness"]
+    g = exps["solidity"]
+    h = exps["area_m2"]
+
+    formula_generic = (
+        "score = density^a * peak^b * extent^c * consensus_support^d * "
+        "prominence^e * compactness^f * solidity^g * area^h"
+    )
+    formula_numeric = (
+        "score = density^"
+        f"{a:.2f} * peak^{b:.2f} * extent^{c:.2f} * consensus_support^{d:.2f} * "
+        f"prominence^{e:.2f} * compactness^{f:.2f} * solidity^{g:.2f} * area^{h:.2f}"
+    )
+    exponent_legend = (
+        f"a={a:.2f}, b={b:.2f}, c={c:.2f}, d={d:.2f}, "
+        f"e={e:.2f}, f={f:.2f}, g={g:.2f}, h={h:.2f}"
+    )
+    return exps, formula_generic, formula_numeric, exponent_legend
+
+
+def score_formula_readable(run_params_data: dict | None) -> tuple[str, pd.DataFrame]:
+    exps, _, _, _ = score_formula_strings(run_params_data)
+    readable = (
+        "Score =\n"
+        f"  Density^{exps['density']:.2f}\n"
+        f"  x PeakRelief^{exps['peak_relief_m']:.2f}\n"
+        f"  x Extent^{exps['extent']:.2f}\n"
+        f"  x Support^{exps['consensus_support']:.2f}\n"
+        f"  x Prominence^{exps['prominence_m']:.2f}\n"
+        f"  x Compactness^{exps['compactness']:.2f}\n"
+        f"  x Solidity^{exps['solidity']:.2f}\n"
+        f"  x Area^{exps['area_m2']:.2f}"
+    )
+    rows = [
+        {
+            "Component": "Density",
+            "Exponent": round(exps["density"], 2),
+            "Meaning": "How concentrated nearby candidate features are.",
+        },
+        {
+            "Component": "Peak Relief",
+            "Exponent": round(exps["peak_relief_m"], 2),
+            "Meaning": "Strength of the local topographic high point.",
+        },
+        {
+            "Component": "Extent",
+            "Exponent": round(exps["extent"], 2),
+            "Meaning": "How much of the candidate bounding box is filled.",
+        },
+        {
+            "Component": "Consensus Support",
+            "Exponent": round(exps["consensus_support"], 2),
+            "Meaning": "How consistently the candidate appears across thresholds.",
+        },
+        {
+            "Component": "Prominence",
+            "Exponent": round(exps["prominence_m"], 2),
+            "Meaning": "How much the candidate stands out from nearby terrain.",
+        },
+        {
+            "Component": "Compactness",
+            "Exponent": round(exps["compactness"], 2),
+            "Meaning": "How non-line-like the shape is.",
+        },
+        {
+            "Component": "Solidity",
+            "Exponent": round(exps["solidity"], 2),
+            "Meaning": "How solid/convex (vs fragmented) the shape is.",
+        },
+        {
+            "Component": "Area",
+            "Exponent": round(exps["area_m2"], 2),
+            "Meaning": "Footprint size influence in the final ranking.",
+        },
+    ]
+    return readable, pd.DataFrame(rows)
+
+
+def score_breakdown_df(row: pd.Series, run_params_data: dict | None) -> pd.DataFrame | None:
+    exps, _, _, _ = score_formula_strings(run_params_data)
     floors = {
         "density": 1e-9,
         "peak_relief_m": 1e-9,
@@ -1298,8 +1412,50 @@ if (Object.keys(clusterCounts).length > 0) {{
   legend.addTo(map);
 }}
 
-if (bounds.length > 0) {{
-  map.fitBounds(bounds, {{ padding: [24, 24] }});
+if (bounds.length > 1) {{
+  const latLngBounds = L.latLngBounds(bounds);
+  const lats = bounds.map(b => Number(b[0]));
+  const lons = bounds.map(b => Number(b[1]));
+  const minLat = Math.min(...lats);
+  const maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons);
+  const maxLon = Math.max(...lons);
+  const meanLatRad = ((minLat + maxLat) / 2.0) * Math.PI / 180.0;
+
+  // Approximate bbox perimeter in kilometers to tune initial zoom/padding.
+  const latKm = Math.abs(maxLat - minLat) * 111.32;
+  const lonKm = Math.abs(maxLon - minLon) * 111.32 * Math.max(0.1, Math.cos(meanLatRad));
+  const perimeterKm = 2.0 * (latKm + lonKm);
+
+  let padFrac = 0.04;
+  let maxZoom = 15;
+  if (perimeterKm >= 150) {{
+    padFrac = 0.12;
+    maxZoom = 11;
+  }} else if (perimeterKm >= 80) {{
+    padFrac = 0.09;
+    maxZoom = 12;
+  }} else if (perimeterKm >= 35) {{
+    padFrac = 0.07;
+    maxZoom = 13;
+  }} else if (perimeterKm >= 15) {{
+    padFrac = 0.05;
+    maxZoom = 14;
+  }} else if (perimeterKm >= 6) {{
+    padFrac = 0.04;
+    maxZoom = 15;
+  }} else if (perimeterKm >= 2) {{
+    padFrac = 0.03;
+    maxZoom = 16;
+  }} else {{
+    padFrac = 0.02;
+    maxZoom = 17;
+  }}
+
+  map.fitBounds(latLngBounds.pad(padFrac), {{ padding: [12, 12], maxZoom: maxZoom }});
+}} else if (bounds.length === 1) {{
+  // Single-point runs should still open with context around the candidate.
+  map.setView(bounds[0], 16);
 }} else {{
   map.setView([17.0, -89.0], 10);
 }}
@@ -1431,7 +1587,7 @@ with st.sidebar:
         uploaded = st.file_uploader("LAZ/LAS file", type=["laz", "las"])
         st.caption("Saved into `data/lidar/` for this run.")
     else:
-        input_local = st.text_input("Local path", value="data/lidar/bz_hr_las31_crs.laz")
+        input_local = st.text_input("Local path", value="data/lidar/sample.laz")
 
     st.divider()
     st.markdown("### 2) Run")
@@ -2189,15 +2345,55 @@ with tab_results:
             else:
                 df = df_loaded
             quality = assess_run_quality(used, df)
+            _, _, score_formula_numeric, _ = score_formula_strings(run_params_data)
+            score_formula_readable_str, score_weights_df = score_formula_readable(run_params_data)
 
-            st.markdown(
-                (
-                    "<div style='display:inline-block; padding:6px 12px; border-radius:999px; "
-                    f"font-weight:700; color:{quality['tone']}; background:{quality['bg']}; border:1px solid {quality['tone']}22;'>"
-                    f"Run quality: {quality['label']} ({quality['passed']}/{quality['total']} checks)</div>"
-                ),
-                unsafe_allow_html=True,
-            )
+            quality_check_help: dict[str, str] = {
+                "Candidate count in useful review range": "Enough candidates for review without overwhelming volume.",
+                "At least one non-noise cluster": "Verifies DBSCAN found structure beyond all-noise outputs.",
+                "Top score threshold": "Checks whether the strongest candidate has meaningful composite signal.",
+                "Median score threshold": "Checks whether overall candidate quality is not driven by one outlier.",
+                "Noise fraction threshold": "Checks that DBSCAN noise does not dominate kept candidates.",
+            }
+
+            detail_rows: list[dict[str, str]] = []
+            for item in quality.get("check_details", []):
+                if not isinstance(item, dict):
+                    continue
+                passed = item.get("passed")
+                if passed is True:
+                    status = "PASS"
+                elif passed is False:
+                    status = "FAIL"
+                else:
+                    status = "N/A"
+                check_label = str(item.get("label", "Check"))
+                detail_rows.append(
+                    {
+                        "Status": status,
+                        "Check": check_label,
+                        "Observed": str(item.get("observed", "—")),
+                        "Target": str(item.get("target", "—")),
+                        "Tooltip": quality_check_help.get(check_label, "Quality heuristic check."),
+                    }
+                )
+            quality_summary = f"Run quality: {quality['label']} ({quality['passed']}/{quality['total']} checks)"
+            with st.expander(quality_summary, expanded=False):
+                if detail_rows:
+                    detail_df = pd.DataFrame(detail_rows)
+                    st.dataframe(
+                        detail_df[["Status", "Check", "Observed", "Target", "Tooltip"]].rename(columns={"Tooltip": "Why it matters"}),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                st.caption("These checks are triage heuristics for review confidence, not archaeological validation.")
+            with st.expander("Scoring formula explanation", expanded=False):
+                st.code(score_formula_readable_str, language="text")
+                st.caption(
+                    "Higher exponent means that component influences ranking more strongly. "
+                    "This score ranks candidates within a run; it is not a probability."
+                )
+                st.dataframe(score_weights_df, width="stretch", hide_index=True)
 
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Candidates", used.get("candidates_kept", "—"))
@@ -2243,6 +2439,11 @@ with tab_results:
                                     value=score_min,
                                     step=step,
                                     format="%.3f",
+                                    help=(
+                                        "Composite ranking score filter. "
+                                        "Higher score means higher review priority in this run. "
+                                        "See 'Scoring formula explanation' above."
+                                    ),
                                 )
                             else:
                                 min_score_filter = score_min
@@ -2506,7 +2707,15 @@ with tab_results:
 
                             with detail_tabs[0]:
                                 s1, s2, s3, s4 = st.columns(4)
-                                s1.metric("Score", f"{float(selected_row['score']):.3f}" if "score" in selected_row else "—")
+                                s1.metric(
+                                    "Score",
+                                    f"{float(selected_row['score']):.3f}" if "score" in selected_row else "—",
+                                    help=(
+                                        "Composite ranking metric used by MayaScan. "
+                                        "Higher means higher review priority within this run. "
+                                        "See 'Scoring formula explanation' near the top of Results."
+                                    ),
+                                )
                                 s2.metric("Peak relief (m)", f"{float(selected_row['peak_relief_m']):.2f}" if "peak_relief_m" in selected_row else "—")
                                 s3.metric("Support", f"{int(selected_row['consensus_support'])}" if "consensus_support" in selected_row and pd.notna(selected_row["consensus_support"]) else "—")
                                 s4.metric("Prominence (m)", f"{float(selected_row['prominence_m']):.2f}" if "prominence_m" in selected_row else "—")
@@ -2559,6 +2768,10 @@ with tab_results:
                             with detail_tabs[explain_idx]:
                                 breakdown = score_breakdown_df(selected_row, run_params_data)
                                 if breakdown is not None:
+                                    st.caption(
+                                        "Component-level contribution for this candidate "
+                                        "(each term = component_value ^ exponent)."
+                                    )
                                     st.dataframe(
                                         breakdown[["component", "raw_value", "exponent", "term"]],
                                         width="stretch",
