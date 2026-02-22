@@ -1101,6 +1101,64 @@ L.control.layers(
     if tilelayer_re.search(html2):
         html2 = tilelayer_re.sub(replacement, html2)
 
+    # Align report-tab map framing with Results map tab:
+    # fit all candidates with adaptive padding/zoom, plus single-point fallback.
+    fit_bounds_re = re.compile(
+        r"""if\s*\(\s*bounds\.length\s*>\s*0\s*\)\s*\{\s*map\.fitBounds\(\s*bounds\s*,\s*\{\s*padding\s*:\s*\[[^\]]+\]\s*\}\s*\)\s*;\s*\}""",
+        re.DOTALL,
+    )
+
+    fit_bounds_replacement = """
+if (bounds.length > 1) {
+  const latLngBounds = L.latLngBounds(bounds);
+  const lats = bounds.map(b => Number(b[0]));
+  const lons = bounds.map(b => Number(b[1]));
+  const minLat = Math.min(...lats);
+  const maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons);
+  const maxLon = Math.max(...lons);
+  const meanLatRad = ((minLat + maxLat) / 2.0) * Math.PI / 180.0;
+
+  // Approximate bbox perimeter in kilometers to tune initial zoom/padding.
+  const latKm = Math.abs(maxLat - minLat) * 111.32;
+  const lonKm = Math.abs(maxLon - minLon) * 111.32 * Math.max(0.1, Math.cos(meanLatRad));
+  const perimeterKm = 2.0 * (latKm + lonKm);
+
+  let padFrac = 0.04;
+  let maxZoom = 15;
+  if (perimeterKm >= 150) {
+    padFrac = 0.12;
+    maxZoom = 11;
+  } else if (perimeterKm >= 80) {
+    padFrac = 0.09;
+    maxZoom = 12;
+  } else if (perimeterKm >= 35) {
+    padFrac = 0.07;
+    maxZoom = 13;
+  } else if (perimeterKm >= 15) {
+    padFrac = 0.05;
+    maxZoom = 14;
+  } else if (perimeterKm >= 6) {
+    padFrac = 0.04;
+    maxZoom = 15;
+  } else if (perimeterKm >= 2) {
+    padFrac = 0.03;
+    maxZoom = 16;
+  } else {
+    padFrac = 0.02;
+    maxZoom = 17;
+  }
+
+  map.fitBounds(latLngBounds.pad(padFrac), { padding: [12, 12], maxZoom: maxZoom });
+} else if (bounds.length === 1) {
+  // Single-point runs should still open with context around the candidate.
+  map.setView(bounds[0], 16);
+}
+""".strip()
+
+    if fit_bounds_re.search(html2):
+        html2 = fit_bounds_re.sub(fit_bounds_replacement, html2)
+
     return html2
 
 
